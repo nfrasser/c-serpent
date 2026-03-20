@@ -21,7 +21,7 @@ class CustomBuild(build_py):
 
 setup(
     name='cserpent',
-    version='1.1.3',
+    version='1.1.4',
     ext_modules=[Extension('cserpent_py', sources=['cserpent_py.c'])],
     cmdclass={ 'build_py': CustomBuild, },
     package_data={'cserpent': ['cserpent']},

@@ -134,8 +134,8 @@ typedef struct
 } CSerpentArgs;
 
 enum { 
-	MAX_STRINGS_EXP=15, 
-	MAX_STRING_HEAP=(1<<22),
+	MAX_STRINGS_EXP=17, 
+	MAX_STRING_HEAP=(1<<24),
 	MAX_SYMBOLS=10000,
 };
 
@@ -261,7 +261,7 @@ repr_token(int bufsz, char buf[], Token t)
 				      if (t.toktype >= 0 && t.toktype < 256)
 					      snprintf(buf, bufsz,"%c", (int) t.toktype);
 				      else {
-					      snprintf(buf, bufsz,"<<<UNKNOWN TOKEN %ld >>>\n", t.toktype);
+					      snprintf(buf, bufsz,"<<<UNKNOWN TOKEN %d >>>\n", t.toktype);
 				      }
 				      break;
 	}
@@ -1856,7 +1856,7 @@ lex_file(StorageBuffers *st,
 }
 
 
-static int 
+static void 
 read_file_with_includes(
 		StorageBuffers *st, 
 		CSerpentArgs args, 
