@@ -5,7 +5,7 @@ C-SERPENT
 
 C-serpent is a tool designed to make it easier to call C code from Python.
 CPython (the main Python implementation) has a C API that makes it possible
-to write "extension modles" in C. These extension modules are imported and
+to write "extension modules" in C. These extension modules are imported and
 called just like regular Python code, but are actually written in C.
 However, that API has a bit of a learning curve. C-serpent aims to make 
 this process easier by automatically generating the necessary "wrapper" 
@@ -99,12 +99,12 @@ be raised if the supplied types don't match.
 Compiling
 ---------
 
-To built C-serpent, just point your C compiler at cserpent.c. 
+To build C-serpent, just point your C compiler at cserpent.c. 
 For example on a unix-derivative, 
 
     $ cc -g cserpent.c -o cserpent 
 
-If you can define `CSERPENT_DISABLE_ASSERT` to compile out assertions, if
+You can define `CSERPENT_DISABLE_ASSERT` to compile out assertions, if
 you wish to.
         
 Usage
@@ -184,10 +184,10 @@ Flags:
 
     -f16 enable support for _Float16 (requires compiler support)
 
-    -a   allow python integers, representing raw address, to be passed 
+    -a   allow python integers, representing raw addresses, to be passed 
          where numpy arrays are otherwise expected.
 
-    -b   allow bytes objects to be bassed where numpy arrays are
+    -b   allow bytes objects to be passed where numpy arrays are
          otherwise expected.
       
     -m   the following argument is the name of the module to be built   
@@ -256,7 +256,7 @@ Flags:
                                                                                    
     -e,n,chkfn   for functions that follow: after calling, another function called  
          chkfn should be called.  chkfn should have the signature    
-         'const char * checkfn (?)' where ? is the type of the n-th argument to the  
+         'const char * chkfn (?)' where ? is the type of the n-th argument to the  
          function (0 means the function's return value). if the chkfn call returns  
          a non-null string, that string is assumed to be an error message and a    
          python exception is generated.   
@@ -272,7 +272,7 @@ Generic functions:
                                                                                
      If you have several copies of a function that accept arguments that are   
      of different data types, then c-serpent may be able to automatically      
-     generate a disapatch function for you, that allows it to be called from   
+     generate a dispatch function for you, that allows it to be called from   
      python in a type-generic way. In order to use this feature, your function 
      must use a function-name suffix to indicate the data type, following this 
      convention: 
@@ -290,10 +290,12 @@ Generic functions:
        uint64          L 
         
        float           f 
+       _Float16        h 
        double          d 
         
-       complex float   F 
-       complex double  D 
+       complex float    F 
+       complex _Float16 H 
+       complex double   D 
                                                                                
      You do not need to supply all of these variants; c-serpent will support   
      whichever variants it finds. 

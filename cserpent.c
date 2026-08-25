@@ -59,17 +59,17 @@ const char *type_category_strings[] = {
 
 typedef struct type {
 	enum type_category category;
-	short explicit_signed : 1;
-	short is_unsigned  : 1;
-	short is_complex   : 1;
-	short is_imaginary : 1;
-	short is_const     : 1;
-	short is_restrict  : 1;
-	short is_volatile  : 1;
-	short is_pointer          : 1;
-	short is_pointer_const    : 1;
-	short is_pointer_restrict : 1;
-	short is_pointer_volatile : 1;
+	unsigned short explicit_signed : 1;
+	unsigned short is_unsigned  : 1;
+	unsigned short is_complex   : 1;
+	unsigned short is_imaginary : 1;
+	unsigned short is_const     : 1;
+	unsigned short is_restrict  : 1;
+	unsigned short is_volatile  : 1;
+	unsigned short is_pointer          : 1;
+	unsigned short is_pointer_const    : 1;
+	unsigned short is_pointer_restrict : 1;
+	unsigned short is_pointer_volatile : 1;
 } Type;
 
 
@@ -1952,7 +1952,7 @@ usage(void)
 	"resulting file. It only understands a subset of all possible C typedefs, but  \n"
 	"it works for stdint, size_t, and so on. The preprocessor to use is 'cc -E'   \n"
 	"by default, but this can be overridden with the -p flag, or the CSERPENT_PP  \n"
-	"environment variable (the latter takes precedence if both are supplied).  \n"
+	"environment variable (the former takes precedence if both are supplied).  \n"
 	"  \n"
 	"Flags:   \n"
 	"                                                                               \n"
@@ -1963,7 +1963,7 @@ usage(void)
 	"-a   allow python integers, representing raw addresses, to be passed    \n"
 	"     where numpy arrays are otherwise expected.  \n"
 	"                                                                               \n"
-	"-b   allow python bytes objects  to be passed where numpy arrays are           \n"
+	"-b   allow python bytes objects to be passed where numpy arrays are            \n"
 	"     otherwise expected.  \n"
 	"                                                                               \n"
 	"-v   verbose (prints a list of typedefs that were parsed, for debugging).  \n"
@@ -1996,7 +1996,7 @@ usage(void)
 	"                                                                               \n"
 	"     this flag only lasts until the next file change (i.e. -f)   \n"
 	"                                                                               \n"
-	"-i   the following argument is a filename, to be inlcuded before the next    \n"
+	"-i   the following argument is a filename, to be included before the next    \n"
 	"     file processed (for use with -P).  \n"
 	"                                                                               \n"
 	"-I   the following argument is a directory path, to be searched for any    \n"
@@ -2029,7 +2029,7 @@ usage(void)
 	"                                                                               \n"
 	"-e,n,chkfn   for functions that follow: after calling, another function called  \n"
 	"     chkfn should be called.  chkfn should have the signature    \n"
-	"     'const char * checkfn (?)' where ? is the type of the n-th argument to the  \n"
+	"     'const char * chkfn (?)' where ? is the type of the n-th argument to the  \n"
 	"     function (0 means the function's return value). if the chkfn call returns  \n"
 	"     a non-null string, that string is assumed to be an error message and a    \n"
 	"     python exception is generated.   \n"
@@ -2046,7 +2046,7 @@ usage(void)
 	"                                                                               \n"
 	"     If you have several copies of a function that accept arguments that are   \n"
 	"     of different data types, then c-serpent may be able to automatically      \n"
-	"     generate a disapatch function for you, that allows it to be called from   \n"
+	"     generate a dispatch function for you, that allows it to be called from   \n"
 	"     python in a type-generic way. In order to use this feature, your function \n"
 	"     must use a function-name suffix to indicate the data type, following this \n"
 	"     convention: \n"
@@ -2307,7 +2307,7 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 			}
 
 			// we're expecting a filename to follow, or '-' to indicate stdin, but not another flag yet
-			if(*argv && (!strcmp(*argv, "-")) || **argv != '-') {
+			if(*argv && (!strcmp(*argv, "-") || **argv != '-')) {
 
 				// This section does a lot of resetting of individual bits of the args struct.
 				// TODO: improve so that we can just memset a whole sub-struct to 0.
