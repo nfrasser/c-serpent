@@ -135,6 +135,9 @@ typedef struct {
 	signed char  addresses;
 	signed char  bytes;
 	signed char  strip_underscore;
+	/* CSERPENT_CONVERTER: user-written marshalling functions */
+	const char *from_python;
+	const char *to_python;
 	/*
 		CSERPENT_WRAPTYPE lists, as (start, count) into the shared name pool.
 		readonly_n == -1 means every member is read-only.
@@ -151,6 +154,7 @@ enum wrap_kind {
 	WK_CONST,
 	WK_OPAQUE,
 	WK_TYPE,
+	WK_CONVERTER,
 };
 
 typedef struct {
@@ -208,7 +212,20 @@ opt_or_cfg(signed char item, ConfigVal cfg, int fallback)
 enum {
 	MAX_STRUCT_MEMBERS = 100,
 	MAX_WRAPPED_TYPES  = 64,
+	MAX_CONVERTERS     = 64,
 };
+
+/*
+	A user-supplied conversion between a C type and a Python object. The type
+	is not named in the annotation; it is read off the converter's own
+	signature, so it appears exactly once and the compiler type-checks it.
+*/
+typedef struct {
+	Type        key;
+	const char *from_python;
+	const char *to_python;
+	Loc         loc;
+} Converter;
 
 typedef struct {
 	int    nmembers;
@@ -281,6 +298,10 @@ typedef struct {
 	// Parsed struct/union definitions, one per CSERPENT_WRAPTYPE
 	int nstructdefs;
 	StructDef structdefs[MAX_WRAPPED_TYPES];
+
+	// Registered type converters, resolved in pass 2
+	int nconverters;
+	Converter converters[MAX_CONVERTERS];
 
 	// Preprocessed text of each input, kept between passes. stdin can only be
 	// read once, and re-running cpp per pass would be wasteful anyway.
@@ -1024,6 +1045,31 @@ enum member_kind {
 	MK_POINTER,     /* any other pointer, incl. function pointers */
 };
 
+/*
+	Converters are keyed on the exact type, pointer-ness included, so they are
+	matched more strictly than compare_types_equal does (which ignores tags).
+*/
+static int
+converter_type_match(Type a, Type b)
+{
+	if (a.category   != b.category)   return 0;
+	if (a.is_pointer  != b.is_pointer)  return 0;
+	if (a.is_unsigned != b.is_unsigned) return 0;
+	if (a.is_complex  != b.is_complex)  return 0;
+	if (!a.tag != !b.tag) return 0;
+	if (a.tag && strcmp(a.tag, b.tag)) return 0;
+	return 1;
+}
+
+static Converter *
+converter_for(StorageBuffers *st, Type t)
+{
+	for (int i = 0; i < st->nconverters; i++)
+		if (converter_type_match(st->converters[i].key, t))
+			return &st->converters[i];
+	return 0;
+}
+
 static int
 wrapped_type_index(StorageBuffers *st, const char *name)
 {
@@ -1142,7 +1188,9 @@ emit_call(const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, S
 	{
 		char *sep  =  i ? ", " : "";
 		int mk = classify_member(st, fnargs[i].type);
-		if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
+		if (converter_for(st, fnargs[i].type)) {
+			fprintf(args.ostream, "%s%s", sep, fnargs[i].name);
+		} else if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
 			/* already unpacked into a local of the right type */
 			fprintf(args.ostream, "%s%s", sep, fnargs[i].name);
 		} else if (is_array(fnargs[i].type)) {
@@ -1178,7 +1226,7 @@ emit_py_buildvalue_fmt_char(CSerpentArgs args, Type t)
 }
 
 static void
-emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, Symbol fnargs[], Type rtntype)
+emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, Symbol fnargs[], Type rtntype, int is_static)
 {
 	assert(n_fnargs >= 0);
 
@@ -1188,8 +1236,9 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 	int use_bytes     = opt_or_cfg(o_bytes,     args.cfg_bytes,     0);
 	int emit_decls    = args.cfg_declarations.value < 0 ? 1 : args.cfg_declarations.value;
 
-	// declaration for function to be wrapped
-	if(emit_decls) {
+	// declaration for function to be wrapped; never for a static one, whose
+	// definition must already be in this translation unit
+	if(emit_decls && !is_static) {
 		char buf[200] = {0};
 		assert(ssizeof(buf) > repr_type(sizeof(buf), buf, rtntype));
 
@@ -1229,7 +1278,14 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 
 			int mk = classify_member(st, arg.type);
 
-			if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
+			if (converter_for(st, arg.type)) {
+				char tb[200] = {0};
+				repr_type(sizeof(tb), tb, arg.type);
+				fprintf(args.ostream, "    PyObject *%s_obj = NULL;\n", arg.name);
+				fprintf(args.ostream, "    %s %s;\n", tb, arg.name);
+			}
+
+			else if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
 				char tb[200] = {0};
 				Type bt = basetype(arg.type);
 				repr_type(sizeof(tb), tb, bt);
@@ -1273,7 +1329,8 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 
 			int mk = classify_member(st, arg.type);
 
-			if      (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) fprintf(args.ostream, "O");
+			if      (converter_for(st, arg.type)) fprintf(args.ostream, "O");
+			else if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) fprintf(args.ostream, "O");
 			else if (is_string(arg.type))  fprintf(args.ostream, "z");
 			else if (is_voidptr(arg.type)) fprintf(args.ostream, "K");
 			else if (is_array(arg.type))   fprintf(args.ostream, "O");
@@ -1299,7 +1356,9 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 
 			int mk = classify_member(st, arg.type);
 
-			if      (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL)
+			if      (converter_for(st, arg.type))
+			                               fprintf(args.ostream, "&%s_obj", arg.name);
+			else if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL)
 			                               fprintf(args.ostream, "&%s_obj", arg.name);
 			else if (is_string(arg.type))  fprintf(args.ostream, "&%s", arg.name);
 			else if (is_voidptr(arg.type)) fprintf(args.ostream, "&%s_ull", arg.name);
@@ -1315,8 +1374,21 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 			Symbol arg = fnargs[i];
 
 			int mk = classify_member(st, arg.type);
+			Converter *conv = converter_for(st, arg.type);
 
-			if (mk == MK_STRUCTPTR) {
+			if (conv) {
+				if (!conv->from_python) {
+					char tb[200] = {0};
+					repr_type(sizeof(tb), tb, arg.type);
+					die2(args, "Error wrapping function '%s' in file '%s': argument "
+					     "'%s' has type '%s', whose converter has no from_python",
+					     fn, args.filename, arg.name, tb);
+				}
+				fprintf(args.ostream, "    if (!%s(%s_obj, \"%s\", &%s)) return 0;\n",
+					conv->from_python, arg.name, arg.name, arg.name);
+			}
+
+			else if (mk == MK_STRUCTPTR) {
 				fprintf(args.ostream,
 					"    if (!cs_%s_ptr(%s_obj, \"%s\", 1, &%s)) return 0;\n",
 					arg.type.tag, arg.name, arg.name, arg.name);
@@ -1364,11 +1436,34 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 			        fprintf(args.ostream, "            return 0; \n");
 				fprintf(args.ostream, "        } \n");
 
-				// emit array contiguity check
-				fprintf(args.ostream, "        else if(!PyArray_ISCARRAY((PyArrayObject*)%s_obj)) {\n", arg.name);
+				/*
+					These three were one PyArray_ISCARRAY check, which bundles
+					contiguity, alignment and writeability together and then
+					blames all three on contiguity. Separate messages, because
+					"not C-contiguous" about a contiguous read-only array is a
+					genuinely misleading thing to be told.
+				*/
+				fprintf(args.ostream, "        else if(!PyArray_IS_C_CONTIGUOUS((PyArrayObject*)%s_obj)) {\n", arg.name);
 				fprintf(args.ostream, "            PyErr_SetString(PyExc_ValueError, \"Argument '%s' is not C-contiguous\");\n", arg.name);
-			        fprintf(args.ostream, "            return 0;\n");
+				fprintf(args.ostream, "            return 0;\n");
 				fprintf(args.ostream, "        }\n");
+
+				fprintf(args.ostream, "        else if(!PyArray_ISALIGNED((PyArrayObject*)%s_obj)) {\n", arg.name);
+				fprintf(args.ostream, "            PyErr_SetString(PyExc_ValueError, \"Argument '%s' is not suitably aligned\");\n", arg.name);
+				fprintf(args.ostream, "            return 0;\n");
+				fprintf(args.ostream, "        }\n");
+
+				/*
+					A non-const pointer lets the C function write, so the array
+					must be writeable. A 'const T *' promises it will not, so a
+					read-only array is fine there.
+				*/
+				if (!arg.type.is_const) {
+					fprintf(args.ostream, "        else if(!PyArray_ISWRITEABLE((PyArrayObject*)%s_obj)) {\n", arg.name);
+					fprintf(args.ostream, "            PyErr_SetString(PyExc_ValueError, \"Argument '%s' is read-only, but this function takes a non-const pointer and may write to it\");\n", arg.name);
+					fprintf(args.ostream, "            return 0;\n");
+					fprintf(args.ostream, "        }\n");
+				}
 				fprintf(args.ostream, "        else %s_data = PyArray_DATA((PyArrayObject*)%s_obj); \n", arg.name, arg.name);
 				fprintf(args.ostream, "    }\n");
 			}
@@ -1420,6 +1515,26 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return PyLong_FromVoidPtr(rtn);\n");
+
+	} else if (converter_for(st, rtntype)) {
+
+		Converter *conv = converter_for(st, rtntype);
+		char buf[200] = {0};
+		repr_type(sizeof(buf), buf, rtntype);
+
+		if (!conv->to_python)
+			die2(args, "Error wrapping function '%s' in file '%s': return type "
+			     "'%s' has a converter, but it has no to_python",
+			     fn, args.filename, buf);
+
+		fprintf(args.ostream, "    %s rtn;\n", buf);
+		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		fprintf(args.ostream, "    rtn = ");
+		emit_call(fn, args, st, n_fnargs, fnargs);
+		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
+		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
+		fprintf(args.ostream, "    return %s(rtn);\n", conv->to_python);
 
 	} else if (classify_member(st, rtntype) == MK_STRUCTPTR
 		|| classify_member(st, rtntype) == MK_STRUCTVAL) {
@@ -2007,7 +2122,16 @@ supported_type(ParseCtx *p, Type *t)
 
 	else if (typedef_name(p, t)) return 1;
 
-	else if (eat_token(p, '*')) { return modify_type_pointer(p,t); }
+	else if (p->tokens[0].toktype == '*') {
+		/*
+			Type carries a single pointer bit, so T** cannot be represented.
+			Leave the '*' unconsumed rather than eating it and silently
+			producing a T*, which is what this used to do.
+		*/
+		if (t && t->is_pointer) return 0;
+		p->tokens++;
+		return modify_type_pointer(p,t);
+	}
 
 	else if (p->tokens[0].toktype == CLEX_id) {
 
@@ -2026,6 +2150,17 @@ supported_type(ParseCtx *p, Type *t)
 			modify_type_union(p,t);
 			char *tag = 0;
 			if (identifier(p, &tag) && t) t->tag = tag;
+			return 1;
+		}
+
+		/*
+			An enum is an int as far as wrapping is concerned. Accepting it
+			here is the natural complement to CSERPENT_WRAPCONST, which
+			exports the constants themselves.
+		*/
+		if (eat_identifier(p, "enum")) {
+			identifier(p, 0);   /* optional tag */
+			modify_type_int(p,t);
 			return 1;
 		}
 
@@ -2090,10 +2225,12 @@ supported_typedef(ParseCtx *p, Symbol *s)
 	*/
 	{
 		Symbol tmp2 = *s;
-		int is_union = 0;
+		int is_union = 0, is_enum = 0;
 
 		if (eat_identifier(p, "typedef")
-			&& (eat_identifier(p, "struct") || (is_union = eat_identifier(p, "union"))))
+			&& (eat_identifier(p, "struct")
+				|| (is_union = eat_identifier(p, "union"))
+				|| (is_enum  = eat_identifier(p, "enum"))))
 		{
 			identifier(p, 0);   /* optional tag */
 
@@ -2110,11 +2247,16 @@ supported_typedef(ParseCtx *p, Symbol *s)
 				}
 
 				if (identifier(p, &tmp2.name) && eat_token(p, ';')) {
-					tmp2.type = (Type){
-						.category = is_union ? T_UNION : T_STRUCT,
-						.tag = tmp2.name,
-						.tag_is_typedef = 1,
-					};
+					if (is_enum) {
+						/* 'typedef enum { ... } Foo;' -- Foo is an int */
+						tmp2.type = (Type){ .category = T_INT };
+					} else {
+						tmp2.type = (Type){
+							.category = is_union ? T_UNION : T_STRUCT,
+							.tag = tmp2.name,
+							.tag_is_typedef = 1,
+						};
+					}
 					*s = tmp2;
 					return 1;
 				}
@@ -2177,7 +2319,12 @@ arg(ParseCtx *p, const char *fn, Symbol *fnarg, int fatal, int decay_arrays)
 	}
 
 	if(!identifier(p, &tmp.name)) {
-		if(fatal) die(p, "error wrapping function '%s' in '%s': expected identifier (i.e. argument name)", fn, p->args.filename);
+		if(fatal) {
+			if (p->tokens != p->tokens_end && p->tokens[0].toktype == '*')
+				die(p, "error wrapping '%s' in '%s': pointer-to-pointer types are not supported",
+					fn, p->args.filename);
+			die(p, "error wrapping function '%s' in '%s': expected identifier (i.e. argument name)", fn, p->args.filename);
+		}
 		RESTORE(p);
 		return 0;
 	}
@@ -2279,16 +2426,38 @@ attributes(ParseCtx *p, const char *fn)
 
 
 
-static void 
-process_function(ParseCtx p, Symbol argsyms[static MAX_FN_ARGS])
+/*
+	Parse a function's signature, with p.tokens on the function name. Split out
+	of process_function so that converters can be resolved by reading a
+	signature without emitting a wrapper for it.
+*/
+static void
+parse_function_signature(ParseCtx p, Symbol argsyms[static MAX_FN_ARGS],
+                         int *out_nargs, Type *out_rtn, int *out_static)
 {
-	// on entry, p.tokens is set right on the function name.	
+	// on entry, p.tokens is set right on the function name.
 	const char * fn = p.tokens[0].string;
 
 	// rewind to last semicolon / closing brace
 	while(p.tokens[0].toktype != ';' && p.tokens[0].toktype != '}') 
 		p.tokens--;
 	p.tokens++; // then move past the semicolon / closing brace we're on
+
+	/*
+		Storage class and inline specifiers are not part of the type. A static
+		function can still be wrapped, as long as the wrapper ends up in the
+		same translation unit -- but c-serpent must not then emit a
+		non-static declaration for it.
+	*/
+	int is_static = 0;
+	while (1) {
+		if (eat_identifier(&p, "static")) { is_static = 1; continue; }
+		if (eat_identifier(&p, "inline"))    continue;
+		if (eat_identifier(&p, "extern"))    continue;
+		if (eat_identifier(&p, "_Noreturn")) continue;
+		break;
+	}
+	if (out_static) *out_static = is_static;
 
 	Type rtn_t = {0};
 	memset(argsyms, 0, MAX_FN_ARGS*sizeof(argsyms[0]));
@@ -2313,8 +2482,20 @@ process_function(ParseCtx p, Symbol argsyms[static MAX_FN_ARGS])
 	if(!(eat_token(&p, ';') || eat_token(&p, '{')))
 		die(&p, "error wrapping function '%s' in '%s': parse error (encountered unrecognized garbage)", fn, p.args.filename);
 
-	// Parse successful, emit the wrapper!
-	emit_wrapper (fn, p.args, p.storage, num_args, argsyms, rtn_t);
+	*out_nargs = num_args;
+	*out_rtn   = rtn_t;
+}
+
+static void
+process_function(ParseCtx p, Symbol argsyms[static MAX_FN_ARGS])
+{
+	const char *fn = p.tokens[0].string;
+	int num_args = 0;
+	Type rtn_t = {0};
+
+	int is_static = 0;
+	parse_function_signature(p, argsyms, &num_args, &rtn_t, &is_static);
+	emit_wrapper (fn, p.args, p.storage, num_args, argsyms, rtn_t, is_static);
 }
 
 static void 
@@ -2330,6 +2511,24 @@ advance_and_skip_braced_blocks(ParseCtx *p)
 		assert(depth >= 0);
 		p->tokens++;
 	}
+}
+
+/* find a function and read its signature, without emitting anything */
+static int
+parse_file_look_for_signature(ParseCtx p, const char *function_name,
+                              Symbol argsyms[static MAX_FN_ARGS],
+                              int *out_nargs, Type *out_rtn)
+{
+	long len = strlen(function_name);
+
+	while (p.tokens != p.tokens_end) {
+		if (check_token_is_identifier(p.tokens, function_name, len)) {
+			parse_function_signature(p, argsyms, out_nargs, out_rtn, 0);
+			return 1;
+		}
+		advance_and_skip_braced_blocks(&p);
+	}
+	return 0;
 }
 
 static int 
@@ -2460,8 +2659,12 @@ process_enum(ParseCtx p, StorageBuffers *st)
 	identifier(&p, &enum_name);
 	char *tag = intern_string(p.args, st, enum_name, 0);
 
-	// expect brace
-	if(!eat_token(&p, '{')) die(&p, "parse error in enum %s: expected '{'", enum_name);
+	/*
+		Only a definition has a brace. 'enum Foo x;' is a use, not a
+		definition, and contributes no constants -- bailing out rather than
+		erroring matters because system headers are full of them.
+	*/
+	if(!eat_token(&p, '{')) return 0;
 
 	// parse enum constants
 	int nconsts = 0;
@@ -2724,9 +2927,10 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 	int is_config  = !strcmp(macro, "CSERPENT_CONFIG");
 	int is_opaque  = !strcmp(macro, "CSERPENT_OPAQUE");
 	int is_type    = !strcmp(macro, "CSERPENT_WRAPTYPE");
+	int is_conv    = !strcmp(macro, "CSERPENT_CONVERTER");
 
 	if (!(is_fn || is_generic || is_manual || is_const || is_module || is_config
-		|| is_opaque || is_type))
+		|| is_opaque || is_type || is_conv))
 		die_at(*args, loc, "unknown annotation '%s'", macro);
 
 	if (is_module) {
@@ -2739,6 +2943,42 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 			       module_loc->file, module_loc->line);
 		args->modulename = nm;
 		*module_loc = loc;
+		return;
+	}
+
+	if (is_conv) {
+		/*
+			No positional argument: the type is read off the converter's
+			signature rather than named here, which is what lets a converter
+			be registered for a type whose name is not a single identifier,
+			and stops the annotation and the function drifting apart.
+		*/
+		WrapOpts c = { .errarg = 0, .errstr = -1, .addresses = -1,
+		               .bytes = -1, .strip_underscore = -1 };
+
+		for (int k = 0; k < na; k++) {
+			if (!a[k].key)
+				die_at(*args, loc, "CSERPENT_CONVERTER takes only 'from_python =' "
+				       "and 'to_python =' options; the type comes from the "
+				       "converter's own signature");
+			if (!strcmp(a[k].key, "from_python"))
+				c.from_python = ann_ident(*args, loc, macro, a[k].key, a[k].val);
+			else if (!strcmp(a[k].key, "to_python"))
+				c.to_python = ann_ident(*args, loc, macro, a[k].key, a[k].val);
+			else
+				die_at(*args, loc, "CSERPENT_CONVERTER: unknown option '%s'", a[k].key);
+		}
+
+		if (!c.from_python && !c.to_python)
+			die_at(*args, loc, "CSERPENT_CONVERTER needs 'from_python' or 'to_python'");
+
+		if (st->nitems == MAX_ITEMS)
+			die_at(*args, loc, "too many annotations (max %i)", (int)MAX_ITEMS);
+		st->items[st->nitems++] = (WrapItem){
+			.kind = WK_CONVERTER,
+			.name = c.from_python ? c.from_python : c.to_python,
+			.opts = c, .input = input_index, .def = -1, .loc = loc,
+		};
 		return;
 	}
 
@@ -3239,6 +3479,24 @@ usage(void)
 	"    the same way it needs to see enum constants: either assemble it into   \n"
 	"    the same translation unit, or prepend the relevant #include. \n"
 	"                                                                               \n"
+	"CSERPENT_CONVERTER(from_python = fn, to_python = fn) \n"
+	"    Teach c-serpent a type it does not know, by supplying the conversion  \n"
+	"    yourself. The type is not named here: it is read off the converter's  \n"
+	"    own signature, which must be \n"
+	"                                                                               \n"
+	"      int fn(PyObject *o, const char *argname, T *out)   /* from_python */ \n"
+	"      PyObject *fn(T value)                              /* to_python   */ \n"
+	"                                                                               \n"
+	"    from_python returns 1 on success, or 0 with a python exception set.    \n"
+	"    Either direction may be omitted; using the type in a direction with no \n"
+	"    converter is an error. Once registered, every wrapped function taking  \n"
+	"    or returning T is handled automatically. \n"
+	"                                                                               \n"
+	"    Converters are keyed on the exact type, so they apply to T by value.   \n"
+	"    Registering one for a type that is also CSERPENT_WRAPTYPE'd is an      \n"
+	"    error. Note that a converter which hands C a pointer into a python     \n"
+	"    object is only valid for the duration of the call. \n"
+	"                                                                               \n"
 	"CSERPENT_OPAQUE(TypeName) \n"
 	"    Treat TypeName as equivalent to void, so pointers to it convert to and   \n"
 	"    from python integers. Useful for structs c-serpent cannot wrap. \n"
@@ -3297,7 +3555,11 @@ wrapopts_equal(WrapOpts a, WrapOpts b)
 		&& a.invalidates == b.invalidates
 		&& a.fields_at == b.fields_at   && a.fields_n == b.fields_n
 		&& a.exclude_at == b.exclude_at && a.exclude_n == b.exclude_n
-		&& a.readonly_at == b.readonly_at && a.readonly_n == b.readonly_n;
+		&& a.readonly_at == b.readonly_at && a.readonly_n == b.readonly_n
+		&& ((a.from_python == b.from_python)
+			|| (a.from_python && b.from_python && !strcmp(a.from_python, b.from_python)))
+		&& ((a.to_python == b.to_python)
+			|| (a.to_python && b.to_python && !strcmp(a.to_python, b.to_python)));
 	#undef SAMESTR
 }
 
@@ -3311,6 +3573,7 @@ wrap_kind_name(int kind)
 		case WK_CONST:   return "CSERPENT_WRAPCONST";
 		case WK_OPAQUE:  return "CSERPENT_OPAQUE";
 		case WK_TYPE:    return "CSERPENT_WRAPTYPE";
+		case WK_CONVERTER: return "CSERPENT_CONVERTER";
 	}
 	return "?";
 }
@@ -3552,6 +3815,95 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 				.tokens_first = tokens, .tokens = tokens,
 				.tokens_end = tokens+ntok, .storage = storage, .args = args, });
 
+		/*
+			Converter signatures mention PyObject, so make it known whether or
+			not the input included Python.h. c-serpent emits Python C API code
+			regardless, so this is not really an assumption about the input.
+		*/
+		if (!get_symbol(storage, "PyObject"))
+			add_symbol(args, storage, (Symbol){
+				.name = "PyObject",
+				.type = {.category = T_STRUCT, .tag = "_object"},
+			});
+
+		/*
+			Resolve converters: the target type is the third parameter of
+			from_python with one level of indirection removed, or the first
+			parameter of to_python.
+		*/
+		for (int k = 0; k < storage->nitems; k++) {
+			if (storage->items[k].kind != WK_CONVERTER) continue;
+			if (storage->items[k].input != i) continue;
+
+			WrapItem *it = &storage->items[k];
+			Symbol csyms[MAX_FN_ARGS] = {0};
+			int cn = 0;
+			Type crtn = {0}, key = {0};
+			int have_key = 0;
+
+			if (it->opts.from_python) {
+				if (!parse_file_look_for_signature(
+						(ParseCtx){ .tokens_first=tokens, .tokens=tokens,
+						            .tokens_end=tokens+ntok, .storage=storage,
+						            .args=args },
+						it->opts.from_python, csyms, &cn, &crtn))
+					die_at(args, it->loc, "no function called '%s' in '%s'",
+						it->opts.from_python, inputs[i]);
+
+				if (cn != 3 || !csyms[2].type.is_pointer)
+					die_at(args, it->loc,
+						"CSERPENT_CONVERTER: '%s' must have the signature "
+						"'int %s(PyObject *o, const char *argname, T *out)'",
+						it->opts.from_python, it->opts.from_python);
+
+				key = csyms[2].type;
+				key.is_pointer = 0;
+				have_key = 1;
+			}
+
+			if (it->opts.to_python) {
+				if (!parse_file_look_for_signature(
+						(ParseCtx){ .tokens_first=tokens, .tokens=tokens,
+						            .tokens_end=tokens+ntok, .storage=storage,
+						            .args=args },
+						it->opts.to_python, csyms, &cn, &crtn))
+					die_at(args, it->loc, "no function called '%s' in '%s'",
+						it->opts.to_python, inputs[i]);
+
+				if (cn != 1)
+					die_at(args, it->loc,
+						"CSERPENT_CONVERTER: '%s' must have the signature "
+						"'PyObject *%s(T value)'",
+						it->opts.to_python, it->opts.to_python);
+
+				if (have_key && !converter_type_match(key, csyms[0].type))
+					die_at(args, it->loc,
+						"CSERPENT_CONVERTER: '%s' and '%s' are for different types",
+						it->opts.from_python, it->opts.to_python);
+
+				key = csyms[0].type;
+				have_key = 1;
+			}
+
+			if (key.is_pointer)
+				die_at(args, it->loc,
+					"CSERPENT_CONVERTER: converters for pointer types are not "
+					"supported; register one for the value type instead");
+
+			if (converter_for(storage, key))
+				die_at(args, it->loc, "a converter for this type is already registered");
+
+			if (storage->nconverters == MAX_CONVERTERS)
+				die_at(args, it->loc, "too many converters (max %i)", (int)MAX_CONVERTERS);
+
+			storage->converters[storage->nconverters++] = (Converter){
+				.key = key,
+				.from_python = it->opts.from_python,
+				.to_python   = it->opts.to_python,
+				.loc = it->loc,
+			};
+		}
+
 		for (int k = 0; k < storage->nitems; k++) {
 			if (storage->items[k].kind != WK_TYPE) continue;
 			if (storage->items[k].input != i) continue;
@@ -3572,6 +3924,13 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 			storage->items[k].def = storage->nstructdefs++;
 		}
 	}
+
+	for (int c = 0; c < storage->nconverters; c++)
+		if (storage->converters[c].key.tag
+			&& wrapped_type_index(storage, storage->converters[c].key.tag) >= 0)
+			die_at(args, storage->converters[c].loc,
+				"'%s' has both a converter and a CSERPENT_WRAPTYPE; pick one",
+				storage->converters[c].key.tag);
 
 	for (int k = 0; k < storage->nitems; k++)
 		if (storage->items[k].kind == WK_TYPE && storage->items[k].def < 0)
@@ -3636,7 +3995,7 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 
 			WrapItem *it = &storage->items[k];
 			if (it->input != i) continue;
-			if (it->kind == WK_TYPE) continue;
+			if (it->kind == WK_TYPE || it->kind == WK_CONVERTER) continue;
 
 			args.opts = &it->opts;
 

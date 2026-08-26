@@ -81,6 +81,12 @@ Python, and populate them with C code). Non-void pointer arguments also
 accept `None`, which results in a null pointer being passed to the C function.
 `stdint.h` types are supported, since they are just typedefs.
 
+Array arguments must be C-contiguous and suitably aligned. They must also be
+writeable, unless the parameter is `const`-qualified — C-serpent cannot tell
+which arguments a function writes to, so it goes by the pointer type. Declaring
+a read-only parameter as `const T *` is what lets a caller pass a read-only
+numpy array to it.
+
 Example, consider this C function:
 
     double mean_i32(int N, int32_t *array) 
@@ -362,6 +368,64 @@ Annotations
         `CSERPENT_CONFIG(declarations = 0)` and compile the generated code in
         the same translation unit as the definition, or prepend an `#include`
         of the relevant header to the output.
+
+    CSERPENT_CONVERTER(from_python = fn, to_python = fn)
+
+        Teach C-serpent a type it doesn't know, by supplying the conversion
+        yourself. This is the extension point: a project with its own array
+        view, handle, or string type can plug it in once and have every
+        function that uses it wrapped automatically.
+
+        The type is not named in the annotation. It is read off the converter's
+        own signature, so it appears exactly once and the C compiler checks it:
+
+            int       fn(PyObject *o, const char *argname, T *out)   /* from_python */
+            PyObject *fn(T value)                                    /* to_python   */
+
+        `from_python` returns 1 on success, or 0 with a Python exception set —
+        the same convention as the helpers C-serpent generates for wrapped
+        structs. Either direction may be omitted; using the type in a direction
+        that has no converter is an error naming the missing one.
+
+        For example, given a non-owning 2-D view:
+
+```c
+typedef struct { double *data; int64_t rows, cols; } View2D;
+
+static int view2d_from_obj(PyObject *o, const char *argname, View2D *out)
+{
+    PyArrayObject *a = (PyArrayObject *)o;
+    if (!PyArray_Check(o) || PyArray_TYPE(a) != NPY_DOUBLE
+        || PyArray_NDIM(a) != 2 || !PyArray_ISCARRAY(a)) {
+        PyErr_Format(PyExc_ValueError,
+            "argument '%s' must be a C-contiguous 2-D float64 array", argname);
+        return 0;
+    }
+    out->data = PyArray_DATA(a);
+    out->rows = PyArray_DIM(a, 0);
+    out->cols = PyArray_DIM(a, 1);
+    return 1;
+}
+
+#ifdef CSERPENT
+CSERPENT_CONVERTER(from_python = view2d_from_obj)
+#endif
+```
+
+        after which `double view_sum(View2D v)` takes a numpy array from Python
+        with nothing further to write. Put the annotation in the header that
+        defines the type and every consumer of that header gets it for free.
+
+        How permissive the conversion is, is entirely up to you: if your view
+        type carries strides, the converter can accept an array sliced along an
+        outer axis rather than insisting on full C-contiguity. C-serpent has no
+        opinion about it — that logic lives in code you own and can test.
+
+        Converters are keyed on the exact type and apply to `T` by value.
+        Registering one for a type that is also `CSERPENT_WRAPTYPE`'d is an
+        error — pick one. A converter that hands C a pointer into a Python
+        object (as the example does) is only valid for the duration of the
+        call; the C function must not retain it.
 
     CSERPENT_OPAQUE(TypeName)
 

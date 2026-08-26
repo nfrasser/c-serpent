@@ -87,6 +87,16 @@ for bad in (lambda: m.sum_i32(2, numpy.array([1.0, 2.0])),
 
 # a null array argument is allowed
 assert m.sum_i32(0, None) == 0
+
+# a read-only array cannot be passed where C takes a non-const pointer, and the
+# message says so rather than blaming contiguity
+ro = numpy.array([1, 2], dtype=numpy.int32)
+ro.setflags(write=False)
+try:
+    m.sum_i32(2, ro)
+    raise AssertionError("expected ValueError for a read-only array")
+except ValueError as e:
+    assert "read-only" in str(e), e
 """),
 
     dict(name="functional_bytes_and_addresses",
@@ -219,4 +229,295 @@ except TypeError:
     pass
 """),
 
+
+    dict(name="functional_converter",
+         module="fn_view",
+         # the converters mention PyObject and numpy, so c-serpent's own
+         # preprocessor run needs the real include directories
+         args=["-p", "cc -E -I@PYINC@ -I@NPINC@"],
+         src=r"""
+#include <stdint.h>
+#define NPY_NO_DEPRECATED_API NPY_1_8_API_VERSION
+#include <Python.h>
+#include <numpy/arrayobject.h>
+
+/* ---- the project's own view types ------------------------------------- */
+
+typedef struct
+{
+        float *p;
+	int64_t n;     // length
+} View1D;
+
+typedef struct
+{
+        float *p;
+	int64_t n[2];  // shape
+	int64_t st[1]; // stride in elements, implied contiguous last dimension
+} View2D;
+
+typedef struct
+{
+        float *p;
+	int64_t n[3];  // shape
+	int64_t st[2]; // stride in elements, implied contiguous last dimension
+} View3D;
+
+typedef struct
+{
+        float *p;
+	int64_t n[4];  // shape
+	int64_t st[3]; // stride in elements, implied contiguous last dimension
+} View4D;
+
+/* ---- the converters ---------------------------------------------------- */
+
+/*
+	Shared validation. The view convention is strides in *elements* for every
+	axis but the last, which is implied contiguous -- so this accepts an array
+	sliced along any outer axis, and rejects one whose last axis is strided.
+	numpy strides are in bytes, hence the division.
+*/
+static int cs_view_unpack(PyObject *o, const char *argname, int ndim,
+                          float **p, int64_t *n, int64_t *st)
+{
+	PyArrayObject *a = (PyArrayObject *)o;
+	const npy_intp isz = (npy_intp) sizeof(float);
+
+	if (!PyArray_Check(o)) {
+		PyErr_Format(PyExc_TypeError,
+			"argument '%s' must be a numpy array", argname);
+		return 0;
+	}
+	if (PyArray_TYPE(a) != NPY_FLOAT) {
+		PyErr_Format(PyExc_ValueError,
+			"argument '%s' must have dtype float32", argname);
+		return 0;
+	}
+	if (PyArray_NDIM(a) != ndim) {
+		PyErr_Format(PyExc_ValueError,
+			"argument '%s' must be %d-dimensional, not %d-dimensional",
+			argname, ndim, PyArray_NDIM(a));
+		return 0;
+	}
+	if (!PyArray_ISALIGNED(a)) {
+		PyErr_Format(PyExc_ValueError,
+			"argument '%s' is not suitably aligned", argname);
+		return 0;
+	}
+	/*
+		The view hands C a mutable float*, and mutation is the common case,
+		so a read-only array must be refused rather than silently written to.
+	*/
+	if (!PyArray_ISWRITEABLE(a)) {
+		PyErr_Format(PyExc_ValueError,
+			"argument '%s' is read-only, but the view allows writing", argname);
+		return 0;
+	}
+	if (PyArray_STRIDE(a, ndim-1) != isz) {
+		PyErr_Format(PyExc_ValueError,
+			"argument '%s' must be contiguous along its last axis", argname);
+		return 0;
+	}
+
+	for (int i = 0; i < ndim; i++)
+		n[i] = (int64_t) PyArray_DIM(a, i);
+
+	for (int i = 0; i < ndim-1; i++) {
+		npy_intp s = PyArray_STRIDE(a, i);
+		if (s % isz) {
+			PyErr_Format(PyExc_ValueError,
+				"argument '%s' has a stride that is not a whole number of elements",
+				argname);
+			return 0;
+		}
+		st[i] = (int64_t)(s / isz);
+	}
+
+	*p = (float *) PyArray_DATA(a);
+	return 1;
+}
+
+/*
+	Building an array back out. The result does not own its memory and has no
+	base object, so whatever owns the buffer must outlive it.
+*/
+static PyObject *cs_view_pack(float *p, int ndim, const int64_t *n, const int64_t *st)
+{
+	npy_intp dims[4], strides[4];
+
+	for (int i = 0; i < ndim; i++) dims[i] = (npy_intp) n[i];
+	strides[ndim-1] = (npy_intp) sizeof(float);
+	for (int i = 0; i < ndim-1; i++)
+		strides[i] = (npy_intp) st[i] * (npy_intp) sizeof(float);
+
+	return PyArray_New(&PyArray_Type, ndim, dims, NPY_FLOAT, strides,
+	                   p, 0, NPY_ARRAY_WRITEABLE, NULL);
+}
+
+static int view1d_from_obj(PyObject *o, const char *argname, View1D *out)
+{
+	int64_t n[1], st[1];
+	if (!cs_view_unpack(o, argname, 1, &out->p, n, st)) return 0;
+	out->n = n[0];
+	return 1;
+}
+static int view2d_from_obj(PyObject *o, const char *argname, View2D *out)
+{ return cs_view_unpack(o, argname, 2, &out->p, out->n, out->st); }
+static int view3d_from_obj(PyObject *o, const char *argname, View3D *out)
+{ return cs_view_unpack(o, argname, 3, &out->p, out->n, out->st); }
+static int view4d_from_obj(PyObject *o, const char *argname, View4D *out)
+{ return cs_view_unpack(o, argname, 4, &out->p, out->n, out->st); }
+
+static PyObject *view1d_to_obj(View1D v)
+{ int64_t n[1] = { v.n }; return cs_view_pack(v.p, 1, n, 0); }
+static PyObject *view2d_to_obj(View2D v)
+{ return cs_view_pack(v.p, 2, v.n, v.st); }
+static PyObject *view3d_to_obj(View3D v)
+{ return cs_view_pack(v.p, 3, v.n, v.st); }
+static PyObject *view4d_to_obj(View4D v)
+{ return cs_view_pack(v.p, 4, v.n, v.st); }
+
+/* ---- ordinary project code, with no Python in sight -------------------- */
+
+float sum1(View1D v)
+{
+	float s = 0;
+	for (int64_t i = 0; i < v.n; i++) s += v.p[i];
+	return s;
+}
+
+float sum2(View2D v)
+{
+	float s = 0;
+	for (int64_t i = 0; i < v.n[0]; i++)
+		for (int64_t j = 0; j < v.n[1]; j++)
+			s += v.p[i*v.st[0] + j];
+	return s;
+}
+
+void scale2(View2D v, float k)
+{
+	for (int64_t i = 0; i < v.n[0]; i++)
+		for (int64_t j = 0; j < v.n[1]; j++)
+			v.p[i*v.st[0] + j] *= k;
+}
+
+int64_t rows2(View2D v) { return v.n[0]; }
+
+int64_t stride2(View2D v) { return v.st[0]; }
+
+View2D self2(View2D v) { return v; }
+
+float sum3(View3D v)
+{
+	float s = 0;
+	for (int64_t i = 0; i < v.n[0]; i++)
+		for (int64_t j = 0; j < v.n[1]; j++)
+			for (int64_t k = 0; k < v.n[2]; k++)
+				s += v.p[i*v.st[0] + j*v.st[1] + k];
+	return s;
+}
+
+float sum4(View4D v)
+{
+	float s = 0;
+	for (int64_t i = 0; i < v.n[0]; i++)
+		for (int64_t j = 0; j < v.n[1]; j++)
+			for (int64_t k = 0; k < v.n[2]; k++)
+				for (int64_t l = 0; l < v.n[3]; l++)
+					s += v.p[i*v.st[0] + j*v.st[1] + k*v.st[2] + l];
+	return s;
+}
+
+#ifdef CSERPENT
+CSERPENT_MODULE(fn_view)
+
+CSERPENT_CONVERTER(from_python = view1d_from_obj, to_python = view1d_to_obj)
+CSERPENT_CONVERTER(from_python = view2d_from_obj, to_python = view2d_to_obj)
+CSERPENT_CONVERTER(from_python = view3d_from_obj, to_python = view3d_to_obj)
+CSERPENT_CONVERTER(from_python = view4d_from_obj, to_python = view4d_to_obj)
+
+CSERPENT_WRAPFN(sum1, sum2, sum3, sum4, scale2, rows2, stride2, self2)
+#endif
+""",
+         test=r"""
+import numpy, fn_view as m
+
+def arr(*shape):
+    n = 1
+    for s in shape: n *= s
+    return numpy.arange(n, dtype=numpy.float32).reshape(*shape)
+
+# the plain contiguous cases
+a1, a2, a3, a4 = arr(6), arr(2, 3), arr(2, 3, 4), arr(2, 3, 4, 5)
+assert m.sum1(a1) == a1.sum()
+assert m.sum2(a2) == a2.sum()
+assert m.sum3(a3) == a3.sum()
+assert m.sum4(a4) == a4.sum()
+assert m.rows2(a2) == 2
+
+# the point of carrying strides: an array sliced along an outer axis is still
+# a valid view, because only the last axis has to be contiguous
+big = arr(6, 4)
+sliced = big[::2]                      # stride 8 elements, last axis contiguous
+assert not sliced.flags["C_CONTIGUOUS"]
+assert m.sum2(sliced) == sliced.sum()
+assert m.rows2(sliced) == 3
+
+# strides reach C in *elements*, not bytes: numpy reports 32 bytes here, and
+# the view must say 8. This is what a bytes/elements mix-up would break.
+assert sliced.strides[0] == 32
+assert m.stride2(sliced) == 8
+assert m.stride2(a2) == 3          # contiguous 2x3: one row is 3 elements
+
+col = arr(4, 6)[:, ::2]                # last axis strided: must be rejected
+try:
+    m.sum2(col)
+    raise AssertionError("expected ValueError for a strided last axis")
+except ValueError as e:
+    assert "contiguous along its last axis" in str(e), e
+
+# non-owning, so C writes through to the caller's array -- including a slice
+before = big.copy()
+m.scale2(sliced, 2.0)
+assert (big[::2] == before[::2] * 2).all()
+assert (big[1::2] == before[1::2]).all()      # untouched rows
+
+# the other direction preserves shape and strides
+r = m.self2(sliced)
+assert r.shape == sliced.shape
+assert r.strides == sliced.strides
+r[0, 0] = 99.0
+assert big[0, 0] == 99.0                      # still the same memory
+
+# validation
+try:
+    m.sum2(arr(2, 3).astype(numpy.float64))
+    raise AssertionError("expected ValueError for float64")
+except ValueError as e:
+    assert "dtype float32" in str(e), e
+
+try:
+    m.sum2(a1)
+    raise AssertionError("expected ValueError for wrong ndim")
+except ValueError as e:
+    assert "2-dimensional" in str(e), e
+
+try:
+    m.sum1([1.0, 2.0])
+    raise AssertionError("expected TypeError for a list")
+except TypeError as e:
+    assert "numpy array" in str(e), e
+
+# the view exposes a mutable float*, so a read-only array is refused rather
+# than being written to behind numpy's back
+ro = arr(2, 3)
+ro.setflags(write=False)
+try:
+    m.sum2(ro)
+    raise AssertionError("expected ValueError for a read-only array")
+except ValueError as e:
+    assert "read-only" in str(e), e
+"""),
 ]

@@ -137,7 +137,9 @@ def run_functional_case(exe, workdir, case, python, incs):
     with open(src, "w") as f:
         f.write(case["src"])
 
-    r = subprocess.run([exe] + case.get("args", []) + [src],
+    cargs = [a.replace("@PYINC@", incs[0]).replace("@NPINC@", incs[1])
+             for a in case.get("args", [])]
+    r = subprocess.run([exe] + cargs + [src],
                        capture_output=True, text=True, cwd=d)
     if r.returncode != 0:
         raise Failure("c-serpent failed:\n" + r.stderr.strip()[:900])

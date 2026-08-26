@@ -512,4 +512,167 @@ CSERPENT_WRAPFN(f, wat = 1)
     dict(name="warnings_silent_without_W",
          src="void f(void);\n#ifdef CSERPENT\nCSERPENT_WRAPFN(f)\n#endif\n",
          err_lacks=["warning"]),
+
+    dict(name="array_writeable_required_unless_const",
+         src=PRELUDE + """
+void  fill(int N, float *x);
+float total(int N, const float *x);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(fill, total)
+#endif
+""",
+         # a non-const pointer may be written through, so the array must be
+         # writeable; a const one promises otherwise
+         out_has=["PyArray_ISWRITEABLE", "PyArray_IS_C_CONTIGUOUS", "PyArray_ISALIGNED"]),
+
+    # ------------------------------------------------ converters
+
+    dict(name="converter_arg_and_return",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n[2]; int64_t st[1]; } View2D;
+int view2d_from_obj(PyObject *o, const char *argname, View2D *out);
+PyObject *view2d_to_obj(View2D v);
+float view_sum(View2D v);
+View2D view_self(View2D v);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONVERTER(from_python = view2d_from_obj, to_python = view2d_to_obj)
+CSERPENT_WRAPFN(view_sum, view_self)
+#endif
+""",
+         out_has=['if (!view2d_from_obj(v_obj, "v", &v)) return 0;',
+                  "return view2d_to_obj(rtn);"]),
+
+    dict(name="converter_from_python_only",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, const char *argname, V *out);
+double take(V v);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONVERTER(from_python = v_from)
+CSERPENT_WRAPFN(take)
+#endif
+""",
+         out_has=['if (!v_from(v_obj, "v", &v)) return 0;']),
+
+    dict(name="err_converter_return_without_to_python",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, const char *argname, V *out);
+V make(void);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONVERTER(from_python = v_from)
+CSERPENT_WRAPFN(make)
+#endif
+""",
+         rc=1, err_has=["has a converter, but it has no to_python"]),
+
+    dict(name="err_converter_positional",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, const char *argname, V *out);
+#ifdef CSERPENT
+CSERPENT_CONVERTER(V, from_python = v_from)
+#endif
+""",
+         rc=1, err_has=["takes only 'from_python ='"]),
+
+    dict(name="err_converter_bad_signature",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, V *out);
+#ifdef CSERPENT
+CSERPENT_CONVERTER(from_python = v_from)
+#endif
+""",
+         rc=1, err_has=["must have the signature"]),
+
+    dict(name="err_converter_mismatched_directions",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+typedef struct { float *p; int64_t n[2]; } W;
+int v_from(PyObject *o, const char *argname, V *out);
+PyObject *w_to(W w);
+#ifdef CSERPENT
+CSERPENT_CONVERTER(from_python = v_from, to_python = w_to)
+#endif
+""",
+         rc=1, err_has=["are for different types"]),
+
+    dict(name="err_converter_duplicate",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, const char *argname, V *out);
+int v_from2(PyObject *o, const char *argname, V *out);
+#ifdef CSERPENT
+CSERPENT_CONVERTER(from_python = v_from)
+CSERPENT_CONVERTER(from_python = v_from2)
+#endif
+""",
+         rc=1, err_has=["already registered"]),
+
+    dict(name="err_converter_and_wraptype",
+         src=PRELUDE + """
+typedef struct { float *p; int64_t n; } V;
+int v_from(PyObject *o, const char *argname, V *out);
+#ifdef CSERPENT
+CSERPENT_WRAPTYPE(V)
+CSERPENT_CONVERTER(from_python = v_from)
+#endif
+""",
+         rc=1, err_has=["both a converter and a CSERPENT_WRAPTYPE"]),
+
+    # ------------------------------------------------ parser fixes
+
+    dict(name="err_double_pointer",
+         # used to be silently collapsed to a single pointer
+         src=PRELUDE + """
+typedef struct { int x; } V;
+int f(V **out);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(f)
+#endif
+""",
+         rc=1, err_has=["pointer-to-pointer types are not supported"]),
+
+    dict(name="enum_reference_is_not_a_definition",
+         # 'enum Foo x' is a use, not a definition; system headers are full of
+         # them and this used to be a hard parse error
+         src="""
+enum colour { RED, GREEN };
+int paint(enum colour c);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPCONST(colour)
+CSERPENT_WRAPFN(paint)
+#endif
+""",
+         out_has=['PyModule_AddIntConstant(m, "RED", RED)', "wrap_paint"]),
+
+    dict(name="enum_typedef_usable_as_a_type",
+         src="""
+typedef enum { IDLE, BUSY } State;
+State step(State s);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPCONST(IDLE, BUSY)
+CSERPENT_WRAPFN(step)
+#endif
+""",
+         out_has=["wrap_step", 'PyModule_AddIntConstant(m, "IDLE", IDLE)']),
+
+    dict(name="static_function_gets_no_declaration",
+         src="""
+static int helper(int x) { return x + 1; }
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(helper)
+#endif
+""",
+         out_has=["wrap_helper"],
+         out_lacks=["int  helper (int x);"]),
 ]
