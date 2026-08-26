@@ -92,12 +92,14 @@ class CSerpentModule:
                 self.compiler_config = compiler_config
                 self.last_opath = None
         
-        def compile(self, c_code, functions, 
-                        ccflags=["-O3", "-fopenmp"], 
-                        includedirs=[], # recommend absolute paths 
-                        linkdirs=[],    # recommend absolute paths 
+        def compile(self, c_code, functions,
+                        ccflags=["-O3", "-fopenmp"],
+                        includedirs=[], # recommend absolute paths
+                        linkdirs=[],    # recommend absolute paths
                         linkflags=[],
                         extra_cserpent_flags=[],
+                        constants=[],   # enum tags or enum constants to export
+                        generic=[],     # prefixes to wrap as generic dispatchers
                         ):
                 
                 if 'CSERPENT_EXTRA_INCLUDE_DIRS' in os.environ:
@@ -113,6 +115,8 @@ class CSerpentModule:
 
                 preprocessor_cmd = self.compiler_config['preprocessor'].split()
                 preprocessor_cmd += [self.compiler_config['preprocessor_include_flag'] + d for d in includedirs]
+                # so that any '#ifdef CSERPENT' blocks the user wrote in the cell survive
+                preprocessor_cmd += ['-DCSERPENT', '-DCSERPENT_VERSION=2']
 
                 preprocessor_result = subprocess.run(
                         preprocessor_cmd, 
@@ -130,7 +134,23 @@ class CSerpentModule:
                 now = str(int(time.time()))
                 python_mod_name = self.modname + "_" + now
 
-                cserpent_args = ["-m", python_mod_name, "-D", "-f", "-", "-E"] + extra_cserpent_flags + functions
+                # c-serpent v2 takes its instructions from the source rather than
+                # from flags. The module name is generated per compile (that is how
+                # live reloading works), so the cell author cannot write it -- we
+                # append the annotations ourselves. The text has already been
+                # preprocessed, so these need no '#ifdef CSERPENT' wrapper.
+                annotations = [
+                        "",
+                        "CSERPENT_CONFIG(declarations = 0)",
+                        "CSERPENT_MODULE(%s)" % python_mod_name,
+                ]
+                annotations += ["CSERPENT_WRAPFN(%s)" % f for f in functions]
+                annotations += ["CSERPENT_WRAPFN_GENERIC(%s)" % g for g in generic]
+                if constants:
+                        annotations += ["CSERPENT_WRAPCONST(%s)" % ", ".join(constants)]
+                preprocessed_code += "\n".join(annotations) + "\n"
+
+                cserpent_args = ["-W"] + extra_cserpent_flags + ["-"]
                 cserpent_rtncode, cserpent_stdout, cserpent_stderr = \
                         cserpent_py.run_cserpent(cserpent_args, preprocessed_code)
                 

@@ -97,32 +97,69 @@ typedef struct { // lexer token
 
 #include <setjmp.h>
 
+/*
+	An annotation's source location, recovered from cpp line markers.
+*/
+typedef struct {
+	const char *file;
+	int line;
+} Loc;
+
+/*
+	Per-item options, from the annotation that requested the wrap.
+	Tri-state fields use -1 for "unset, inherit from CSERPENT_CONFIG".
+*/
+typedef struct {
+	const char *py_name;
+	const char *doc;
+	const char *errcheck;
+	int          errarg;
+	signed char  errstr;
+	signed char  addresses;
+	signed char  bytes;
+	signed char  strip_underscore;
+} WrapOpts;
+
+enum wrap_kind {
+	WK_FN = 1,
+	WK_GENERIC,
+	WK_MANUAL,
+	WK_CONST,
+	WK_OPAQUE,
+};
+
+typedef struct {
+	int       kind;
+	const char *name;
+	WrapOpts  opts;
+	int       input;   /* index into the input file list */
+	Loc       loc;
+} WrapItem;
+
+/*
+	Output-global settings from CSERPENT_CONFIG. -1 means unset; loc records
+	where a value was set, so a conflict can name both sites.
+*/
+typedef struct {
+	signed char value;
+	Loc         loc;
+} ConfigVal;
+
 typedef struct
 {
 	int verbose;
-	int float16_support; 
-	int disable_declarations;
-	int enable_addresses_for_arrays;
-	int enable_bytes_for_arrays;
+	int warnings;
 	const char * modulename;
 	const char * filename;
 	const char * preprocessor;
-	int disable_pp;
-	int generic;
-	int generic_keep_trailing_underscore;
-	int ndirs;
-	const char *dirs[MAX_DIRS];
 
-	struct {
-		const char *fn;
-		short active;
-	 	short argno;
-	} error_handling;
+	ConfigVal cfg_addresses;
+	ConfigVal cfg_bytes;
+	ConfigVal cfg_declarations;
+	ConfigVal cfg_float16;
 
-	struct {
-		const char *files[MAX_FILES];
-		int nfiles;
-	} manual_include;
+	/* the item currently being emitted, if any */
+	const WrapOpts *opts;
 
 	FILE *ostream;
 	FILE *estream;
@@ -133,11 +170,44 @@ typedef struct
 
 } CSerpentArgs;
 
-enum { 
-	MAX_STRINGS_EXP=17, 
+/* resolve a per-item tri-state against the global default */
+static int
+opt_or_cfg(signed char item, ConfigVal cfg, int fallback)
+{
+	if (item >= 0) return item;
+	if (cfg.value >= 0) return cfg.value;
+	return fallback;
+}
+
+enum {
+	MAX_STRINGS_EXP=17,
 	MAX_STRING_HEAP=(1<<24),
 	MAX_SYMBOLS=10000,
+	MAX_ANNLOCS=8000,
+	MAX_ITEMS=2000,
+	MAX_ENUMCONSTS=40000,
+	MAX_EXPORTS=4000,
+	MAX_INPUTS=200,
 };
+
+/* one enum constant, with the tag of the enum it belongs to ("" if anonymous) */
+typedef struct {
+	const char *tag;
+	const char *name;
+} EnumConst;
+
+/* one entry in the generated module's method table */
+typedef struct {
+	const char *py_name;
+	const char *c_name;
+	const char *doc;
+} Export;
+
+/* location of a CSERPENT_-prefixed identifier, keyed by its token index */
+typedef struct {
+	int  tok_index;
+	Loc  loc;
+} AnnLoc;
 
 typedef struct {
 
@@ -149,6 +219,26 @@ typedef struct {
 	// Symbol table
 	int nsym;
 	Symbol symbols[MAX_SYMBOLS];
+
+	// Annotation locations, recorded during lexing
+	int nannlocs;
+	AnnLoc annlocs[MAX_ANNLOCS];
+
+	// Every enum constant seen across all inputs, for WRAPCONST resolution
+	int nenumconsts;
+	EnumConst enumconsts[MAX_ENUMCONSTS];
+
+	// Work list, built in pass 1
+	int nitems;
+	WrapItem items[MAX_ITEMS];
+
+	// Module method table, built in pass 2
+	int nexports;
+	Export exports[MAX_EXPORTS];
+
+	// Preprocessed text of each input, kept between passes. stdin can only be
+	// read once, and re-running cpp per pass would be wasteful anyway.
+	char *cached[MAX_INPUTS];
 } StorageBuffers;
 
 typedef struct {
@@ -682,27 +772,22 @@ compare_types_equal(Type a, Type b, int compare_pointer, int compare_const, int 
 	==========================================================
 */
 
-static void 
+static void
 emit_module(
-	CSerpentArgs args, 
-	int n_fnames, 
-	const char *fnames[], 
-	_Bool fname_needs_strip_underscore[],
-	int num_enum_consts, 
+	CSerpentArgs args,
+	int n_exports,
+	Export exports[],
+	int num_enum_consts,
 	char *enum_consts[])
 {
 	if(!args.modulename) return;
 
 	fprintf(args.ostream, "static PyMethodDef module_functions[] = { \n");
 
-	for (int i = 0; i < n_fnames; i++) {
-		char name[500] = {0};
-		int len = snprintf(name, sizeof(name), "%s", fnames[i]);
-		assert(ssizeof(name)-1 > len);
-		if(fname_needs_strip_underscore[i]) name[len-1] = 0;
-
-		fprintf(args.ostream, "{\"%s\", (PyCFunction) wrap_%s, METH_VARARGS|METH_KEYWORDS, \"\"},\n", 
-			name, fnames[i]);
+	for (int i = 0; i < n_exports; i++) {
+		fprintf(args.ostream, "{\"%s\", (PyCFunction) wrap_%s, METH_VARARGS|METH_KEYWORDS, \"%s\"},\n",
+			exports[i].py_name, exports[i].c_name,
+			exports[i].doc ? exports[i].doc : "");
 	}
 
 	fprintf(args.ostream,
@@ -754,12 +839,13 @@ static void
 emit_preamble(CSerpentArgs args)
 {
 	(void) args;
-	char * f16_cplusplus = 
-		args.float16_support ? 
+	int f16 = args.cfg_float16.value > 0;
+	char * f16_cplusplus =
+		f16 ?
 			"template<> struct CSERPENT_C2NPY_struct<_Float16> { static constexpr int value = NPY_FLOAT16; };" :
 			"";
-	char * f16_c = 
-		args.float16_support ? 
+	char * f16_c =
+		f16 ?
 			"_Float16: NPY_FLOAT16," :
 			"";
 	fprintf(args.ostream, 
@@ -859,36 +945,33 @@ basetype(Type t)
 static void 
 emit_exceptionhandling(const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[])
 {
-	if(args.error_handling.active) {
-		
-		if(args.error_handling.fn) {
-			assert(args.error_handling.argno >= 0);
+	const WrapOpts *o = args.opts;
+	if(!o) return;
 
-			if(args.error_handling.argno > n_fnargs)
-				die2(args, "Error wrapping function '%s' in file '%s': "
-				    "flag -e,%i,%s was specified, but function only has "
-				    "%i arguments", 
-				    fn, args.filename, 
-				    args.error_handling.argno, args.error_handling.fn,
-				    n_fnargs);
+	if(o->errcheck) {
 
-			char *exnarg = args.error_handling.argno == 0 
-				? "rtn"
-				: fnargs[args.error_handling.argno-1].name;
+		if(o->errarg < 0 || o->errarg > n_fnargs)
+			die2(args, "Error wrapping function '%s' in file '%s': "
+			    "errcheck = %s, errarg = %i was specified, but the function "
+			    "only has %i arguments",
+			    fn, args.filename, o->errcheck, o->errarg, n_fnargs);
 
-			fprintf(args.ostream, "    const char *_exn = %s(%s);  \n", args.error_handling.fn, exnarg);
-			fprintf(args.ostream, "    if(_exn) {  \n");
-			fprintf(args.ostream, "        PyErr_SetString(PyExc_RuntimeError, _exn);  \n");
-			fprintf(args.ostream, "        return 0;  \n");
-			fprintf(args.ostream, "    }  \n");
-		} else {
-			assert(args.error_handling.argno == 0);
-	
-			fprintf(args.ostream, "    if(rtn) {  \n");
-			fprintf(args.ostream, "        PyErr_SetString(PyExc_RuntimeError, rtn);  \n");
-			fprintf(args.ostream, "        return 0;  \n");
-			fprintf(args.ostream, "    }  \n");
-		}	
+		char *exnarg = o->errarg == 0
+			? "rtn"
+			: fnargs[o->errarg-1].name;
+
+		fprintf(args.ostream, "    const char *_exn = %s(%s);  \n", o->errcheck, exnarg);
+		fprintf(args.ostream, "    if(_exn) {  \n");
+		fprintf(args.ostream, "        PyErr_SetString(PyExc_RuntimeError, _exn);  \n");
+		fprintf(args.ostream, "        return 0;  \n");
+		fprintf(args.ostream, "    }  \n");
+
+	} else if(o->errstr > 0) {
+
+		fprintf(args.ostream, "    if(rtn) {  \n");
+		fprintf(args.ostream, "        PyErr_SetString(PyExc_RuntimeError, rtn);  \n");
+		fprintf(args.ostream, "        return 0;  \n");
+		fprintf(args.ostream, "    }  \n");
 	}
 }
 
@@ -937,8 +1020,14 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 {
 	assert(n_fnargs >= 0);
 
+	signed char o_addresses = args.opts ? args.opts->addresses : -1;
+	signed char o_bytes     = args.opts ? args.opts->bytes     : -1;
+	int use_addresses = opt_or_cfg(o_addresses, args.cfg_addresses, 0);
+	int use_bytes     = opt_or_cfg(o_bytes,     args.cfg_bytes,     0);
+	int emit_decls    = args.cfg_declarations.value < 0 ? 1 : args.cfg_declarations.value;
+
 	// declaration for function to be wrapped
-	if(!args.disable_declarations) {
+	if(emit_decls) {
 		char buf[200] = {0};
 		assert(ssizeof(buf) > repr_type(sizeof(buf), buf, rtntype));
 
@@ -1052,14 +1141,14 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 
 				// emit array type check
 				fprintf(args.ostream, "    if (%s_obj != Py_None) { \n", arg.name);
-				if(args.enable_addresses_for_arrays) {
+				if(use_addresses) {
 					fprintf(args.ostream, "        if (PyLong_Check(%s_obj)) { \n", arg.name);
 					fprintf(args.ostream, "            intptr_t value = PyLong_AsLongLong(%s_obj);\n", arg.name);
 					fprintf(args.ostream, "            if(value==-1 && PyErr_Occurred()) return 0;\n");
 					fprintf(args.ostream, "            %s_data = (void*)value;\n", arg.name);
 					fprintf(args.ostream, "        } else \n");
 				}
-				if(args.enable_bytes_for_arrays) {
+				if(use_bytes) {
 					fprintf(args.ostream, "        if (PyBytes_Check(%s_obj)) { \n", arg.name);
 					fprintf(args.ostream, "            char *value = PyBytes_AsString(%s_obj);\n", arg.name);
 					fprintf(args.ostream, "            if(value==0) return 0;\n");
@@ -1630,7 +1719,7 @@ parse_file_look_for_function(ParseCtx p, const char *function_name, Symbol argsy
 
 
 static int
-process_enum(ParseCtx p, int max_enum_consts, char **enum_const_names)
+process_enum(ParseCtx p, StorageBuffers *st)
 {
 	// current token is set to the 'enum' keyword
 	p.tokens++;
@@ -1639,6 +1728,7 @@ process_enum(ParseCtx p, int max_enum_consts, char **enum_const_names)
 	// optional tag
 	char *enum_name = "";
 	identifier(&p, &enum_name);
+	char *tag = intern_string(p.args, st, enum_name, 0);
 
 	// expect brace
 	if(!eat_token(&p, '{')) die(&p, "parse error in enum %s: expected '{'", enum_name);
@@ -1652,9 +1742,13 @@ process_enum(ParseCtx p, int max_enum_consts, char **enum_const_names)
 		char *const_name = 0;
 		if(!identifier(&p, &const_name)) die(&p, "parse error in enum %s: expected identifier", enum_name);
 
-		if(nconsts < max_enum_consts) {
-			enum_const_names[nconsts++] = intern_string(p.args, p.storage, const_name, strlen(const_name));
-		}
+		if(st->nenumconsts == MAX_ENUMCONSTS)
+			die(&p, "too many enum constants (max %i)", (int)MAX_ENUMCONSTS);
+		st->enumconsts[st->nenumconsts++] = (EnumConst){
+			.tag  = tag,
+			.name = intern_string(p.args, st, const_name, strlen(const_name)),
+		};
+		nconsts++;
 
 		if(eat_token(&p, '=')) {
 			// skip everything until comma or close brace
@@ -1682,23 +1776,301 @@ process_enum(ParseCtx p, int max_enum_consts, char **enum_const_names)
 }
 
 
-static int 
-parse_file_look_for_enums(ParseCtx p, int max_enum_consts, char **enum_const_names)
+static int
+collect_enums(ParseCtx p, StorageBuffers *st)
 {
 	int howmany = 0;
 	while (p.tokens != p.tokens_end) {
 		if (check_token_is_identifier(p.tokens, "enum", 4) )
-		{
-			int nconsts = process_enum(p, max_enum_consts, enum_const_names);
-			enum_const_names += nconsts;
-			max_enum_consts -= nconsts;
-			howmany += nconsts;	
-		}
+			howmany += process_enum(p, st);
 		advance_and_skip_braced_blocks(&p);
 	}
 	return howmany;
 }
 
+
+/*
+	==========================================================
+		Annotation scanning
+	==========================================================
+
+	Annotations are ordinary tokens by the time we see them: an undefined
+	function-like macro passes through the preprocessor untouched. We scan for
+	CSERPENT_-prefixed identifiers, parse the call, and then blank the tokens
+	so the later definition search never mistakes an annotation's mention of a
+	function for the function itself.
+*/
+
+enum { MAX_ANN_ARGS = 64 };
+
+typedef struct {
+	const char *key;   /* NULL for a positional argument */
+	Token       val;
+} AnnArg;
+
+static Loc
+annloc_for(StorageBuffers *st, int tok_index)
+{
+	for (int i = 0; i < st->nannlocs; i++)
+		if (st->annlocs[i].tok_index == tok_index) return st->annlocs[i].loc;
+	return (Loc){ .file = "<unknown>", .line = 0 };
+}
+
+static _Noreturn void
+die_at (CSerpentArgs args, Loc loc, const char * fmt, ...)
+{
+	va_list va;
+	va_start(va, fmt);
+	fprintf(args.estream, "%s:%i: ", loc.file, loc.line);
+	vfprintf(args.estream, fmt, va);
+	va_end(va);
+	fprintf(args.estream, "\n");
+	terminate(&args);
+}
+
+static void
+warn_at (CSerpentArgs args, Loc loc, const char * fmt, ...)
+{
+	if(!args.warnings) return;
+	va_list va;
+	va_start(va, fmt);
+	if (loc.line > 0) fprintf(args.estream, "%s:%i: warning: ", loc.file, loc.line);
+	else              fprintf(args.estream, "%s: warning: ", loc.file);
+	vfprintf(args.estream, fmt, va);
+	va_end(va);
+	fprintf(args.estream, "\n");
+}
+
+/* parse '( arg, arg, ... )' with tokens[i] on the '('; returns index past ')' */
+static int
+parse_ann_args(CSerpentArgs args, Loc loc, const char *macro,
+               Token *tokens, int ntok, int i,
+               int *out_nargs, AnnArg out[])
+{
+	if (i >= ntok || tokens[i].toktype != '(')
+		die_at(args, loc, "%s must be followed by '('", macro);
+	i++;
+
+	int n = 0;
+
+	if (i < ntok && tokens[i].toktype == ')') { *out_nargs = 0; return i+1; }
+
+	while (1) {
+		if (i >= ntok) die_at(args, loc, "%s: unterminated argument list", macro);
+		if (n == MAX_ANN_ARGS) die_at(args, loc, "%s: too many arguments", macro);
+
+		if (tokens[i].toktype == CLEX_id && i+1 < ntok && tokens[i+1].toktype == '=') {
+			if (i+2 >= ntok) die_at(args, loc, "%s: expected a value after '='", macro);
+			out[n].key = tokens[i].string;
+			out[n].val = tokens[i+2];
+			i += 3;
+		} else {
+			out[n].key = 0;
+			out[n].val = tokens[i];
+			i += 1;
+		}
+		n++;
+
+		if (i < ntok && tokens[i].toktype == ',') { i++; continue; }
+		if (i < ntok && tokens[i].toktype == ')') { i++; break; }
+		die_at(args, loc, "%s: expected ',' or ')'", macro);
+	}
+
+	*out_nargs = n;
+	return i;
+}
+
+static const char *
+ann_ident(CSerpentArgs args, Loc loc, const char *macro, const char *what, Token t)
+{
+	if (t.toktype != CLEX_id)
+		die_at(args, loc, "%s: %s must be an identifier", macro, what);
+	return t.string;
+}
+
+static const char *
+ann_string(CSerpentArgs args, Loc loc, const char *macro, const char *what, Token t)
+{
+	if (t.toktype != CLEX_dqstring)
+		die_at(args, loc, "%s: %s must be a quoted string", macro, what);
+	return t.string;
+}
+
+static int
+ann_int(CSerpentArgs args, Loc loc, const char *macro, const char *what, Token t)
+{
+	if (t.toktype != CLEX_intlit)
+		die_at(args, loc, "%s: %s must be an integer", macro, what);
+	return (int) t.int_number;
+}
+
+static int
+ann_bool(CSerpentArgs args, Loc loc, const char *macro, const char *what, Token t)
+{
+	int v = ann_int(args, loc, macro, what, t);
+	if (v != 0 && v != 1)
+		die_at(args, loc, "%s: %s must be 0 or 1", macro, what);
+	return v;
+}
+
+static void
+set_config(CSerpentArgs *args, ConfigVal *cv, const char *key, int v, Loc loc, int or_together)
+{
+	if (or_together) {
+		cv->value = (cv->value > 0) || v;
+		cv->loc = loc;
+		return;
+	}
+	if (cv->value >= 0 && cv->value != v)
+		die_at(*args, loc,
+			"CSERPENT_CONFIG: '%s' set to %i here, but to %i at %s:%i",
+			key, v, cv->value, cv->loc.file, cv->loc.line);
+	cv->value = v;
+	cv->loc = loc;
+}
+
+static void
+handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc loc,
+                  int na, AnnArg a[], int input_index, Loc *module_loc)
+{
+	int is_fn      = !strcmp(macro, "CSERPENT_WRAPFN");
+	int is_generic = !strcmp(macro, "CSERPENT_WRAPFN_GENERIC");
+	int is_manual  = !strcmp(macro, "CSERPENT_WRAPFN_MANUAL");
+	int is_const   = !strcmp(macro, "CSERPENT_WRAPCONST");
+	int is_module  = !strcmp(macro, "CSERPENT_MODULE");
+	int is_config  = !strcmp(macro, "CSERPENT_CONFIG");
+	int is_opaque  = !strcmp(macro, "CSERPENT_OPAQUE");
+
+	if (!(is_fn || is_generic || is_manual || is_const || is_module || is_config || is_opaque))
+		die_at(*args, loc, "unknown annotation '%s'", macro);
+
+	if (is_module) {
+		if (na != 1 || a[0].key)
+			die_at(*args, loc, "CSERPENT_MODULE takes exactly one module name");
+		const char *nm = ann_ident(*args, loc, macro, "the module name", a[0].val);
+		if (args->modulename)
+			die_at(*args, loc, "CSERPENT_MODULE already given at %s:%i "
+			       "(at most once across all inputs)",
+			       module_loc->file, module_loc->line);
+		args->modulename = nm;
+		*module_loc = loc;
+		return;
+	}
+
+	if (is_config) {
+		for (int k = 0; k < na; k++) {
+			if (!a[k].key)
+				die_at(*args, loc, "CSERPENT_CONFIG takes only 'key = value' options");
+			const char *key = a[k].key;
+			int v = ann_bool(*args, loc, macro, key, a[k].val);
+			if      (!strcmp(key, "addresses"))    set_config(args, &args->cfg_addresses,    key, v, loc, 0);
+			else if (!strcmp(key, "bytes"))        set_config(args, &args->cfg_bytes,        key, v, loc, 0);
+			else if (!strcmp(key, "declarations")) set_config(args, &args->cfg_declarations, key, v, loc, 0);
+			else if (!strcmp(key, "float16"))      set_config(args, &args->cfg_float16,      key, v, loc, 1);
+			else die_at(*args, loc, "CSERPENT_CONFIG: unknown key '%s'", key);
+		}
+		return;
+	}
+
+	/* the remaining forms all take names, and all but WRAPCONST take options */
+
+	WrapOpts o = {
+		.errarg = 0, .errstr = -1,
+		.addresses = -1, .bytes = -1, .strip_underscore = -1,
+	};
+	const char *names[MAX_ANN_ARGS];
+	int nnames = 0;
+	int saw_errarg = 0;
+
+	for (int k = 0; k < na; k++) {
+		if (!a[k].key) {
+			/*
+				A macro used as a name has already been expanded by the time
+				we see it, so it arrives as a literal rather than an
+				identifier. Say so; "expected an identifier" is baffling when
+				you wrote what looks like one.
+			*/
+			if (a[k].val.toktype != CLEX_id)
+				die_at(*args, loc, "%s: argument %i is a literal, not a name. "
+				       "If you named a #define, note that it is expanded away "
+				       "before c-serpent sees it, and cannot be wrapped.",
+				       macro, k+1);
+			names[nnames++] = a[k].val.string;
+			continue;
+		}
+		const char *key = a[k].key;
+
+		if (is_const || is_opaque)
+			die_at(*args, loc, "%s takes names only, not options", macro);
+
+		if      (!strcmp(key, "name"))     o.py_name   = ann_string(*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "doc"))      o.doc       = ann_string(*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "errcheck")) o.errcheck  = ann_ident (*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "errstr"))   o.errstr    = ann_bool  (*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "addresses"))o.addresses = ann_bool  (*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "bytes"))    o.bytes     = ann_bool  (*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "errarg")) {
+			o.errarg = ann_int(*args, loc, macro, key, a[k].val);
+			saw_errarg = 1;
+			if (o.errarg < 0) die_at(*args, loc, "%s: errarg must not be negative", macro);
+		}
+		else if (!strcmp(key, "strip_underscore")) {
+			if (!is_generic)
+				die_at(*args, loc, "%s: 'strip_underscore' only applies to CSERPENT_WRAPFN_GENERIC", macro);
+			o.strip_underscore = ann_bool(*args, loc, macro, key, a[k].val);
+		}
+		else die_at(*args, loc, "%s: unknown option '%s'", macro, key);
+	}
+
+	if (nnames == 0)
+		die_at(*args, loc, "%s: expected at least one name", macro);
+	if (is_generic && nnames != 1)
+		die_at(*args, loc, "CSERPENT_WRAPFN_GENERIC takes exactly one prefix");
+	if (o.py_name && nnames > 1)
+		die_at(*args, loc, "%s: 'name' cannot be used with more than one name", macro);
+	if (saw_errarg && !o.errcheck)
+		warn_at(*args, loc, "%s: 'errarg' has no effect without 'errcheck'", macro);
+
+	int kind = is_fn ? WK_FN : is_generic ? WK_GENERIC : is_manual ? WK_MANUAL
+	         : is_const ? WK_CONST : WK_OPAQUE;
+
+	for (int k = 0; k < nnames; k++) {
+		if (st->nitems == MAX_ITEMS)
+			die_at(*args, loc, "too many annotations (max %i)", (int)MAX_ITEMS);
+		st->items[st->nitems++] = (WrapItem){
+			.kind = kind, .name = names[k], .opts = o,
+			.input = input_index, .loc = loc,
+		};
+	}
+}
+
+/*
+	Walk the token stream, handling and then blanking every annotation.
+	collect=0 blanks only, which is what pass 2 needs (the work list is
+	already built, but the tokens still have to be neutralised).
+*/
+static void
+scan_annotations(StorageBuffers *st, CSerpentArgs *args, int ntok, Token *tokens,
+                 int input_index, int collect, Loc *module_loc)
+{
+	for (int i = 0; i < ntok; i++) {
+		if (tokens[i].toktype != CLEX_id) continue;
+		if (strncmp(tokens[i].string, "CSERPENT_", 9)) continue;
+
+		const char *macro = tokens[i].string;
+		Loc loc = annloc_for(st, i);
+
+		AnnArg a[MAX_ANN_ARGS];
+		int na = 0;
+		int end = parse_ann_args(*args, loc, macro, tokens, ntok, i+1, &na, a);
+
+		if (collect)
+			handle_annotation(st, args, macro, loc, na, a, input_index, module_loc);
+
+		for (int k = i; k < end; k++) tokens[k].toktype = ';';
+		i = end - 1;
+	}
+}
 
 /*
 	==========================================================
@@ -1743,22 +2115,14 @@ ingest_file(StorageBuffers *st, CSerpentArgs args, long long text_bufsz, char *t
 		long long len = fread(text, 1, text_bufsz, args.istream);
 		if(len == text_bufsz) die2(args, "input file too long");
 
-	} else if(!args.preprocessor || args.disable_pp) {
-
-		// read the usual way
-		FILE *f = fopen(args.filename, "rb");
-		if(!f) die2(args, "couldn't fopen '%s'", args.filename);
-		*args.open_file = f;
-		long long len = fread(text, 1, text_bufsz, f);
-		if(len == text_bufsz) die2(args, "input file too long");
-		fclose(f);
-		*args.open_file = 0;
-
 	} else {
 
-		// read via popen to preprocessor command
+		// read via popen to preprocessor command. -DCSERPENT is what makes
+		// the annotation blocks visible; nothing else defines it.
 		char cmd[4096] = {0};
-		if(ssizeof(cmd) <= snprintf(cmd, sizeof(cmd), "%s %s", args.preprocessor, args.filename)) 
+		if(ssizeof(cmd) <= snprintf(cmd, sizeof(cmd),
+				"%s -DCSERPENT -DCSERPENT_VERSION=2 %s",
+				args.preprocessor, args.filename))
 			die2(args, "static buffer overflow");
 		
 		FILE *f = popen(cmd, "r");
@@ -1777,8 +2141,49 @@ ingest_file(StorageBuffers *st, CSerpentArgs args, long long text_bufsz, char *t
 }
 
 
-static int 
-lex_file(StorageBuffers *st, 
+/*
+	Parse a cpp line marker ('# 42 "file.h" 1 3') at the start of a line.
+	The lexer itself discards everything after a '#', so this reads the raw
+	text rather than tokens.
+*/
+static int
+parse_line_marker(StorageBuffers *st, CSerpentArgs args, char *p, char *end,
+                  int *out_line, const char **out_file)
+{
+	while (p < end && (*p == ' ' || *p == '\t')) p++;
+	if (p >= end || *p != '#') return 0;
+	p++;
+	while (p < end && (*p == ' ' || *p == '\t')) p++;
+	if (p >= end || !(*p >= '0' && *p <= '9')) return 0;
+
+	int v = 0;
+	while (p < end && *p >= '0' && *p <= '9') {
+		if (v > 100000000) return 0;
+		v = v*10 + (*p - '0');
+		p++;
+	}
+
+	while (p < end && (*p == ' ' || *p == '\t')) p++;
+	if (p >= end || *p != '"') return 0;
+	p++;
+
+	char *start = p;
+	while (p < end && *p != '"' && *p != '\n') p++;
+	if (p >= end || *p != '"') return 0;
+
+	char buf[1024];
+	int n = (int)(p - start);
+	if (n >= ssizeof(buf)) n = sizeof(buf)-1;
+	memcpy(buf, start, n);
+	buf[n] = 0;
+
+	*out_line = v;
+	*out_file = intern_string(args, st, buf, 0);
+	return 1;
+}
+
+static int
+lex_file(StorageBuffers *st,
 		CSerpentArgs args, 
 		long long tokens_maxnum, 
 		Token *tokens, 
@@ -1789,12 +2194,48 @@ lex_file(StorageBuffers *st,
 	int ntok = 0;
 	char *text_start = text;
 
+	/*
+		Location tracking. cpp emits '# 42 "file.h"' markers at every file
+		transition; between markers we count newlines ourselves. Only
+		CSERPENT_-prefixed identifiers get their location recorded, so the
+		side table stays small.
+	*/
+	const char *cur_file = args.filename;
+	int  cur_line   = 1;
+	int  pending_line = -1;     /* set by a marker; takes effect on the next line */
+	char *cursor   = text_start;
+	char *text_end = text_start + strlen(text_start);
+
+	st->nannlocs = 0;
+
+	{
+		int ml; const char *mf;
+		if (parse_line_marker(st, args, text_start, text_end, &ml, &mf)) {
+			cur_file = mf;
+			pending_line = ml;
+		}
+	}
+
 	tokens[ntok++] = (Token){.toktype=';'}; // parser expects token stream to start with a semicolon
 
 	stb_lexer lex = {0};
 	stb_c_lexer_init(&lex, text_start, text+strlen(text_start), (char *) string_store, string_store_bufsz);
 	while(stb_c_lexer_get_token(&lex)) {
 		if(tokens_maxnum == ntok) die2(args, "static buffer overflow");
+
+		while (cursor < lex.where_firstchar) {
+			if (*cursor == '\n') {
+				if (pending_line >= 0) { cur_line = pending_line; pending_line = -1; }
+				else cur_line++;
+
+				int ml; const char *mf;
+				if (parse_line_marker(st, args, cursor+1, text_end, &ml, &mf)) {
+					cur_file = mf;
+					pending_line = ml;
+				}
+			}
+			cursor++;
+		}
 
 		Token t = {.toktype = lex.token};
 		switch(lex.token)
@@ -1847,7 +2288,16 @@ lex_file(StorageBuffers *st,
 					die2(args,"Lex error at line %i, character %i: unknown token %ld", loc.line_number, loc.line_offset, lex.token);
 				}
 				break;
-		}		
+		}
+
+		if (t.toktype == CLEX_id && !strncmp(t.string, "CSERPENT_", 9)) {
+			if (st->nannlocs == MAX_ANNLOCS)
+				die2(args, "too many CSERPENT_ annotations in one file (max %i)", (int)MAX_ANNLOCS);
+			st->annlocs[st->nannlocs++] = (AnnLoc){
+				.tok_index = ntok,
+				.loc = { .file = cur_file, .line = cur_line },
+			};
+		}
 
 		tokens[ntok++] = t;
 	}
@@ -1856,65 +2306,12 @@ lex_file(StorageBuffers *st,
 }
 
 
-static void 
-read_file_with_includes(
-		StorageBuffers *st, 
-		CSerpentArgs args, 
-		long long text_bufsz, 
-		char *text)
+static void
+read_input(StorageBuffers *st, CSerpentArgs args, long long text_bufsz, char *text)
 {
-	// preserve the start of the text buffer and ensure always null terminated.
-	char *text_start = text;
-	memset(text,0,text_bufsz);
-	text_bufsz--;
-
-	/* 
-		If we're manually including files, do so.
-	*/
-
-	for (int i = 0; i < args.manual_include.nfiles; i++)
-	{
-		// try the current directory
-		FILE *f = fopen(args.manual_include.files[i], "rb");
-
-		// try the list of -I paths
-		if(!f) for (int j = 0; j < args.ndirs; j++)
-		{
-			char path[4096] = {0};
-			// TODO accomodate windows
-			if(ssizeof(path) <= snprintf(path, sizeof(path), "%s/%s", args.dirs[j], args.manual_include.files[i])) 
-				die2(args, "static buffer overflow (path too long)");
-			f = fopen(path, "rb");
-			if(f) break;
-		}
-
-		// try the system default path
-		if(!f) {
-			char path[4096] = {0};
-			// TODO accomodate windows
-			if(ssizeof(path) <= snprintf(path, sizeof(path), "/usr/include/%s", args.manual_include.files[i])) 
-				die2(args, "static buffer overflow (path too long)");
-			f = fopen(path, "rb");
-		}
-
-		if(!f) die2(args, "couldn't find file to be manually included: %s", args.manual_include.files[i]);
-
-		*args.open_file = f;
-
-		long long len = fread(text, 1, text_bufsz, f);
-		if(len == text_bufsz) die2(args,"input file too long");
-		text += len;
-		text_bufsz -= len;
-
-		fclose(f);
-		*args.open_file = 0;
-	}
-
-	/*
-		Read input file
-	*/
-
-	ingest_file(st, args, text_bufsz, text_start);
+	// ensure always null terminated
+	memset(text, 0, text_bufsz);
+	ingest_file(st, args, text_bufsz-1, text);
 }
 
 
@@ -1925,183 +2322,176 @@ read_file_with_includes(
 */
 
 
-static void 
+static void
 usage(void)
 {
-	const char *message = 
+	const char *message =
 
-	"c-serpent \n"
-	"========= \n"
+	"c-serpent v2 \n"
+	"============ \n"
 	"                                                                             \n"
-	"Typical usage:  \n"
-	" $ c-serpent -m coolmodule -f my_c_file.c function1 function2 > wrappers.c   \n"
-	" $ cc -fPIC -shared -I/path/to/python/headers \\\n"
-	"       wrappers.c my_c_file.c \\\n"
-	"       -lpython -o coolmodule.so\n"
+	"Usage:  c-serpent [-p CMD] [-v] [-W] [--explain] input.c [input2.c ...] \n"
 	"                                                                             \n"
-
-	"C-serpent processes its input arguments in-order. First specify the name of the  \n"
-	"output python module (which must match the name of the shared library that  \n"
-	"you compile) by using the argument sequence '-m modulename'. Then, specify  \n"
-	"at least one file, using '-f filename.c'. Then, list the names of the   \n"
-	"functions that you wish to generate wrappers for. You can specify multiple  \n"
-	"files like so: '-f minmax.c min max -f avg.c mean median'. The functions are  \n"
-	"assumed to be contained in the file specified by the most recent '-f' flag.  \n"
-	"  \n"
-	"C-serpent invokes the system preprocessor and scans for typedefs in the   \n"
-	"resulting file. It only understands a subset of all possible C typedefs, but  \n"
-	"it works for stdint, size_t, and so on. The preprocessor to use is 'cc -E'   \n"
-	"by default, but this can be overridden with the -p flag, or the CSERPENT_PP  \n"
-	"environment variable (the former takes precedence if both are supplied).  \n"
-	"  \n"
-	"Flags:   \n"
-	"                                                                               \n"
-	"-h   print help message and exit    \n"
-	"  \n"
-	"-f16 enable support for _Float16 (requires compiler support)    \n"
-	"  \n"
-	"-a   allow python integers, representing raw addresses, to be passed    \n"
-	"     where numpy arrays are otherwise expected.  \n"
-	"                                                                               \n"
-	"-b   allow python bytes objects to be passed where numpy arrays are            \n"
-	"     otherwise expected.  \n"
-	"                                                                               \n"
-	"-v   verbose (prints a list of typedefs that were parsed, for debugging).  \n"
-	"                                                                               \n"
-	"-m   the following argument is the name of the module to be built   \n"
-	"     only one module per c-serpent invocation is allowed.  \n"
-	"                                                                               \n"
-	"-f   the following argument is a filename.  \n"
-	"                                                                               \n"
-	"-D   disable including declarations for the functions to be wrapped in the   \n"
-	"     generated wrapper file. This might be used to facilitate amalgamation   \n"
-	"     builds, for example.  \n"
-	"                                                                                \n"
-	"-x   if you have some extra handwritten wrappers, you can use '-x whatever'    \n"
-	"     to include the function 'whatever' (calling 'wrap_whatever') in the       \n"
-	"     generated module. You'll need to prepend the necessary code to the file   \n"
-	"     that c-serpent generates.  \n"
-	"                                                                               \n"
-	"-p   the following argument specifies the preprocessor to use for future   \n"
-	"     files, if different from the default 'cc -E'. Use quotes if you need  \n"
-	"     to include spaces in the preprocessor command.  \n"
-	"                                                                               \n"
-	"-P   disable preprocessing of the next file encountered. This flag only lasts   \n"
-	"     until the next file change (i.e. -f).  \n"
-	"                                                                               \n"
-	"-t   the following argument is a type name, which should be treated as being \n"
-	"     equivalent to void. This is useful for making c-serpent handle pointers to \n"
-	"     unsupported types (e.g. structs) as void pointers (thereby converting them \n"
-	"     to and from python integers). \n"
-	"                                                                               \n"
-	"     this flag only lasts until the next file change (i.e. -f)   \n"
-	"                                                                               \n"
-	"-i   the following argument is a filename, to be included before the next    \n"
-	"     file processed (for use with -P).  \n"
-	"                                                                               \n"
-	"-I   the following argument is a directory path, to be searched for any    \n"
-	"     future -i flags.  \n"
-	"                                                                               \n"
-	"-g   functions that follow are \"generic\". This is explained fully below.      \n"
-	"                                                                               \n"
-	"     this flag only lasts until the next file change (i.e. -f)   \n"
-	"                                                                               \n"
-	"-G   By default, when processing generic functions, c-serpent will remove a  \n"
-        "     trailing underscore from the names of the generated dispatcher function \n"
-	"     (e.g. for functions sum_f and sum_d, the arguments -g -G sum_ would result\n"
-	"     in the dispatcher function simply being called sum). This flag disables \n"
-	"     that functionality, causing trailing underscores to be kept.            \n"
-	"                                                                               \n"
-	"     this flag only lasts until the next file change (i.e. -f)   \n"
-	"                                                                               \n"
-	"-E   For the current file, add all enum constants to the python module.\n"
-	"     Note that the emitted wrapper code needs to be able to access the enum constants.\n"
-	"     This means that you should either: use the -D flag and assemble the generated\n"
-	"     wrapper code into the same translation unit as the file you're including enums\n"
-	"     from, or, in the case of a header file, include the header file in the generated\n"
-	"     wrapper code (by prepending an #include directive to the output, for example).\n"
-	"                                                                               \n"
-	"-e   for functions that follow: if they return a string (const char *), the    \n"
-	"     string is to be interpreted as an error message (if not null) and a python  \n"
-	"     exception should be thrown.  \n"
-	"                                                                               \n"
-	"     this flag only lasts until the next file change (i.e. -f)   \n"
-	"                                                                               \n"
-	"-e,n,chkfn   for functions that follow: after calling, another function called  \n"
-	"     chkfn should be called.  chkfn should have the signature    \n"
-	"     'const char * chkfn (?)' where ? is the type of the n-th argument to the  \n"
-	"     function (0 means the function's return value). if the chkfn call returns  \n"
-	"     a non-null string, that string is assumed to be an error message and a    \n"
-	"     python exception is generated.   \n"
-	"                                                                               \n"
-	"     this flag only lasts until the next file change (i.e. -f)   \n"
-	"                                                                               \n"
-	"Environment variables:   \n"
-	"                                                                               \n"
-	"CSERPENT_PP    \n"
-	"     This variable acts like the -p flag (but the -p flag overrides it)   \n"
-
-	"                                                                               \n"
-	"Generic functions:   \n"
-	"                                                                               \n"
-	"     If you have several copies of a function that accept arguments that are   \n"
-	"     of different data types, then c-serpent may be able to automatically      \n"
-	"     generate a dispatch function for you, that allows it to be called from   \n"
-	"     python in a type-generic way. In order to use this feature, your function \n"
-	"     must use a function-name suffix to indicate the data type, following this \n"
-	"     convention: \n"
-	"                                                                               \n"
-        "       type            suffix \n"
-        "       ----            ------ \n"
-        "       int8            b \n"
-        "       int16           s \n"
-        "       int32           i \n"
-        "       int64           l \n"
-        "        \n"
-        "       uint8           B \n"
-        "       uint16          S \n"
-        "       uint32          I \n"
-        "       uint64          L \n"
-        "        \n"
-        "       float           f \n"
-        "       _Float16        h \n"
-        "       double          d \n"
-        "        \n"
-        "       complex float    F \n"
-        "       complex _Float16 H \n"
-        "       complex double   D \n"
-	"                                                                               \n"
-	"     You do not need to supply all of these variants; c-serpent will support   \n"
-	"     whichever variants it finds. \n"
-	"                                                                               \n"
-	"     Example: consider: $ ./c-serpent -m mymodule -f whatever.c -g mean        \n"
-	"     If whatever.c contains the following functions, then python code will be  \n"
-	"     able to call `mymodule.mean(N, arr)` where arr is a float or double array \n"
-	"                                                                               \n"
-	"       double meanf(int N, float *arr);                                        \n"
-	"       double meand(int N, double *arr);                                       \n"
-	"                                                                               \n"
-	"     C-serpent will try to figure out which arguments change according to the  \n"
-	"     convention and which do not. Return values may also change.               \n"
-	"                                                                               \n"
-	"     Lastly, the type-specific versions of the function do still get wrapped.  \n"
+	"c-serpent generates CPython extension-module wrappers for C functions. What  \n"
+	"to wrap is declared in the source itself, inside '#ifdef CSERPENT' blocks     \n"
+	"that are invisible to every other build. Typical usage is a manifest file    \n"
+	"that includes the headers it needs and otherwise contains only instructions: \n"
+	"                                                                             \n"
+	"    #include \"mylib.h\" \n"
+	"    #ifdef CSERPENT \n"
+	"    CSERPENT_MODULE(mymodule) \n"
+	"    CSERPENT_WRAPFN(mean_i32) \n"
+	"    #endif \n"
+	"                                                                             \n"
+	"    $ c-serpent mymodule.cs.c > wrappers.c \n"
+	"    $ cc -fPIC -shared -I/path/to/python/headers \\\n"
+	"          wrappers.c mylib.c -lpython -o mymodule.so \n"
+	"                                                                             \n"
+	"Annotations may also be placed next to the definitions they describe. They   \n"
+	"work in headers too, so a manifest can wrap code you are unable to edit.     \n"
+	"                                                                             \n"
+	"Flags: \n"
+	"                                                                             \n"
+	"-h          print this message and exit \n"
+	"                                                                             \n"
+	"-p CMD      preprocessor command, default 'cc -E'. Also settable with the    \n"
+	"            CSERPENT_PP environment variable; the flag takes precedence.     \n"
+	"            Include directories go here, e.g. -p \"cc -E -Ivendor/include\".   \n"
+	"                                                                             \n"
+	"-v          verbose: list the typedefs that were parsed \n"
+	"                                                                             \n"
+	"-W          enable warnings \n"
+	"                                                                             \n"
+	"--explain   list every wrap c-serpent found, with the file and line it came  \n"
+	"            from, then exit without generating anything \n"
+	"                                                                             \n"
+	"Input files are positional. '-' means already-preprocessed source on stdin,  \n"
+	"which c-serpent will not preprocess again; whoever preprocessed it must have \n"
+	"passed -DCSERPENT or the annotations will have vanished. \n"
+	"                                                                             \n"
+	"Annotations: \n"
+	"                                                                             \n"
+	"CSERPENT_MODULE(name) \n"
+	"    Name the generated module; must match the .so you build. At most once    \n"
+	"    across all inputs. Omit it to emit wrappers with no module definition.   \n"
+	"                                                                             \n"
+	"CSERPENT_WRAPFN(names..., options...) \n"
+	"    Wrap one or more functions. Options apply to all names given: \n"
+	"      name = \"str\"     name seen from Python, if different (one name only)  \n"
+	"      doc = \"str\"      docstring \n"
+	"      errstr = 1       a non-NULL 'const char *' return is an error message \n"
+	"      errcheck = fn    call fn afterwards; non-NULL 'const char *' -> raise  \n"
+	"      errarg = N       argument handed to errcheck; 0 means the return value \n"
+	"      addresses = 0|1  accept python ints as raw addresses where arrays go   \n"
+	"      bytes = 0|1      accept bytes objects where arrays go \n"
+	"                                                                             \n"
+	"CSERPENT_WRAPFN_GENERIC(prefix, options...) \n"
+	"    Generate a type-dispatching wrapper over the suffixed variants of prefix,\n"
+	"    plus a wrapper for each variant found. Takes all CSERPENT_WRAPFN options,\n"
+	"    plus strip_underscore = 0|1 (default 1: sum_ dispatches as 'sum'). \n"
+	"                                                                             \n"
+	"    Variant suffixes: b s i l = int8/16/32/64, B S I L = uint8/16/32/64, \n"
+	"    f = float, h = _Float16, d = double, and F H D for their complex forms. \n"
+	"    Supply whichever variants you have; c-serpent uses the ones it finds. \n"
+	"                                                                             \n"
+	"CSERPENT_WRAPFN_MANUAL(names..., options...) \n"
+	"    Register a hand-written wrapper. c-serpent adds 'name' to the module and \n"
+	"    expects you to supply a function called 'wrap_name'. Accepts doc/name.   \n"
+	"                                                                             \n"
+	"CSERPENT_WRAPCONST(names...) \n"
+	"    Add integer constants to the module. A name that is an enum tag adds all \n"
+	"    of that enum's constants; a name that is an enum constant adds just it.  \n"
+	"    Anything else is an error: #defines do not survive preprocessing and so  \n"
+	"    cannot be checked. \n"
+	"                                                                             \n"
+	"CSERPENT_OPAQUE(TypeName) \n"
+	"    Treat TypeName as equivalent to void, so pointers to it convert to and   \n"
+	"    from python integers. Useful for structs c-serpent cannot wrap. \n"
+	"                                                                             \n"
+	"CSERPENT_CONFIG(options...) \n"
+	"    Output-wide settings. Setting one key to two different values is an      \n"
+	"    error, except float16, which is OR'd together. \n"
+	"      addresses = 0|1     default for the per-function option \n"
+	"      bytes = 0|1         default for the per-function option \n"
+	"      declarations = 0|1  emit declarations for wrapped functions (default 1)\n"
+	"      float16 = 0|1       enable _Float16 support (needs compiler support)   \n"
+	"                                                                             \n"
+	"Environment variables: \n"
+	"                                                                             \n"
+	"CSERPENT_PP    acts like -p, but the flag overrides it \n"
 	;
 
 	fprintf(stderr, "%s", message);
-	
 }
 
+/*
+	v1 flags, so that an old invocation gets told where its setting went rather
+	than a bare "unrecognized flag".
+*/
+static const char *
+retired_flag_replacement(const char *flag)
+{
+	if (!strcmp(flag, "-f"))  return "input files are now positional";
+	if (!strcmp(flag, "-m"))  return "use CSERPENT_MODULE(name)";
+	if (!strcmp(flag, "-D"))  return "use CSERPENT_CONFIG(declarations = 0)";
+	if (!strcmp(flag, "-f16"))return "use CSERPENT_CONFIG(float16 = 1)";
+	if (!strcmp(flag, "-x"))  return "use CSERPENT_WRAPFN_MANUAL(name)";
+	if (!strcmp(flag, "-g"))  return "use CSERPENT_WRAPFN_GENERIC(prefix)";
+	if (!strcmp(flag, "-G"))  return "use CSERPENT_WRAPFN_GENERIC(prefix, strip_underscore = 0)";
+	if (!strcmp(flag, "-E"))  return "use CSERPENT_WRAPCONST(names...), naming the constants you want";
+	if (!strcmp(flag, "-t"))  return "use CSERPENT_OPAQUE(TypeName)";
+	if (!strcmp(flag, "-a"))  return "use CSERPENT_CONFIG(addresses = 1), or addresses = 1 on a wrap";
+	if (!strcmp(flag, "-b"))  return "use CSERPENT_CONFIG(bytes = 1), or bytes = 1 on a wrap";
+	if (!strcmp(flag, "-P"))  return "removed: preprocessing is now mandatory";
+	if (!strcmp(flag, "-i"))  return "removed: use a real #include and let the preprocessor resolve it";
+	if (!strcmp(flag, "-I"))  return "removed: put include directories in -p, e.g. -p \"cc -E -Ivendor\"";
+	if (!strncmp(flag, "-e", 2)) return "use errstr = 1, or errcheck = fn and errarg = N, on a wrap";
+	return 0;
+}
 
-int 
+static int
+wrapopts_equal(WrapOpts a, WrapOpts b)
+{
+	#define SAMESTR(x) ((a.x == b.x) || (a.x && b.x && !strcmp(a.x, b.x)))
+	return SAMESTR(py_name) && SAMESTR(doc) && SAMESTR(errcheck)
+		&& a.errarg == b.errarg
+		&& a.errstr == b.errstr
+		&& a.addresses == b.addresses
+		&& a.bytes == b.bytes
+		&& a.strip_underscore == b.strip_underscore;
+	#undef SAMESTR
+}
+
+static const char *
+wrap_kind_name(int kind)
+{
+	switch(kind) {
+		case WK_FN:      return "CSERPENT_WRAPFN";
+		case WK_GENERIC: return "CSERPENT_WRAPFN_GENERIC";
+		case WK_MANUAL:  return "CSERPENT_WRAPFN_MANUAL";
+		case WK_CONST:   return "CSERPENT_WRAPCONST";
+		case WK_OPAQUE:  return "CSERPENT_OPAQUE";
+	}
+	return "?";
+}
+
+static void
+add_export(StorageBuffers *st, CSerpentArgs args, const char *py_name, const char *c_name, const char *doc)
+{
+	if (st->nexports == MAX_EXPORTS)
+		die2(args, "too many exported functions (max %i)", (int)MAX_EXPORTS);
+	st->exports[st->nexports++] = (Export){ .py_name=py_name, .c_name=c_name, .doc=doc };
+}
+
+int
 cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream)
 {
-	
 	// allocate all the memory we need up front
-	
+
 	char  *text         = calloc(1, 1<<27);
 	char  *string_store = calloc(1, 0x10000);
 	Token *tokens       = calloc(1, (1<<27) * sizeof(*tokens)); // same size as text buffer -> running out is impossible
-	StorageBuffers *storage = calloc(1, sizeof(*storage)); 
+	StorageBuffers *storage = calloc(1, sizeof(*storage));
 
 	// to facilitate returning from errors deep in the call stack we will use setjmp/longjmp
 	// so we need preserve the pointers on the stack that we need to free later on
@@ -2110,7 +2500,7 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 		FILE *open_file;
 		int success;
 		void *ptrs[4];
-	} _resources = { 
+	} _resources = {
 		.success = 1,
 		.ptrs = {text, string_store, tokens, storage},
 	};
@@ -2124,345 +2514,328 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 	// function begins in earnest
 
 	CSerpentArgs args = {
-			.preprocessor = "cc -E", 
+			.preprocessor = "cc -E",
 			.istream=in_stream,
-			.ostream=out_stream, 
-			.estream=err_stream, 
+			.ostream=out_stream,
+			.estream=err_stream,
 			.jmp = &jmp,
 			.open_file = &_resources.open_file,
+			.cfg_addresses    = {.value = -1},
+			.cfg_bytes        = {.value = -1},
+			.cfg_declarations = {.value = -1},
+			.cfg_float16      = {.value = -1},
 		};
 
-	if(!(text && string_store && tokens && storage)) 
+	if(!(text && string_store && tokens && storage))
 		die2(args,"out of mem");
 
-	int emitted_preamble = 0;
-
-	if (getenv("CSERPENT_PP")) 
+	if (getenv("CSERPENT_PP"))
 		args.preprocessor = getenv("CSERPENT_PP");
 
-	_Bool fname_needs_remove_underscore[200] = {0};
-	const char *fnames[200] = {0};
-	int n_fnames = 0;
+	const char *inputs[MAX_INPUTS];
+	int ninputs = 0;
+	int explain = 0;
 
-	int ntok = 0;
-
-	_Bool enums_added_from_this_file = 0;
-	int num_enum_consts = 0;
-	char *enum_const_names[400] = {0};
+	/*
+		Arguments
+	*/
 
 	while (*argv) {
-		if (!strcmp(*argv, "-h")) {
-			usage();
-			return 0;
-		}
 
-		if (!strcmp(*argv, "-a")) {
-			args.enable_addresses_for_arrays = 1;
+		if (!strcmp(*argv, "-h")) { usage(); goto cleanup; }
+
+		if (!strcmp(*argv, "-v")) { args.verbose  = 1; argv++; continue; }
+		if (!strcmp(*argv, "-W")) { args.warnings = 1; argv++; continue; }
+		if (!strcmp(*argv, "--explain")) { explain = 1; argv++; continue; }
+
+		if (!strcmp(*argv, "-p")) {
+			argv++;
+			if(!*argv) die2(args, "-p must be followed by a preprocessor command");
+			args.preprocessor = *argv;
 			argv++;
 			continue;
 		}
 
-		if (!strcmp(*argv, "-b")) {
-			args.enable_bytes_for_arrays = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-v")) {
-			args.verbose = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-f16")) {
-			args.float16_support = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-g")) {
-			args.generic = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-G")) {
-			args.generic_keep_trailing_underscore = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-P")) {
-			args.disable_pp = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-E")) {
-			argv++;
-			if(!args.filename) die2(args, "encountered -E flag before any file was specified");
-			if(enums_added_from_this_file) die2(args, "multiple -E flags for file %s", args.filename);
-			ParseCtx p = {
-				.tokens_first  =  tokens,
-				.tokens        =  tokens,
-				.tokens_end    =  tokens+ntok,
-				.args          =  args,
-				.storage       =  storage,
-			};
-			num_enum_consts += parse_file_look_for_enums(
-				p, 
-				COUNT_ARRAY(enum_const_names)-num_enum_consts, 
-				enum_const_names+num_enum_consts);
-			enums_added_from_this_file = 1;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-D")) {
-			args.disable_declarations = 1;
-			argv++;
-			continue;
-		}
-
-		if (!strcmp(*argv, "-I")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				if(args.ndirs == COUNT_ARRAY(args.dirs)) die2(args, "A maximum of %i -I flags can be used in a single c-serpent invocation.", (int)COUNT_ARRAY(args.dirs));
-				args.dirs[args.ndirs++] = *argv;
-				argv++;
-			} else {
-				die2(args, "-I flag must be followed by a directory (to be searched for files manually included with -i)");
-			}
-			continue;
-		}
-
-		if (!strcmp(*argv, "-i")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				if(args.manual_include.nfiles == COUNT_ARRAY(args.manual_include.files)) die2(args, "A maximum of %i -i flags can be used per file to be processed.", (int)COUNT_ARRAY(args.manual_include.files));
-				args.manual_include.files[args.manual_include.nfiles++] = *argv;
-				argv++;
-			} else {
-				die2(args, "-i flag must be followed by a file path (to be manually included when processing the next file)");
-			}
-			continue;
-		}
-		
-		if (!strcmp(*argv, "-m")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				args.modulename = *argv;
-				argv++;
-			} else {
-				die2(args, "-m flag must be followed by a valid name (for the generated python module)");
-			}
-			continue;
-		}
-	
-		if (!strcmp(*argv, "-x")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				fnames[n_fnames++] = *argv;
-				if(n_fnames == COUNT_ARRAY(fnames)) 
-					die2(args, "error: c-serpent only supports wrapping up to  %i functions", (int) COUNT_ARRAY(fnames));
-				argv++;
-			} else {
-				die2(args, "-x flag must be followed by a function name");
-			}
-			continue;
-		}
-
-
-		if (!strcmp(*argv, "-p")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				args.preprocessor = *argv;
-				argv++;
-			} else {
-				die2(args, "-p flag must be followed by a program (to serve as preprocessor)");
-			}
-			continue;
-		}
-
-		if (!strcmp(*argv, "-t")) { 
-			argv++;
-			if(*argv && **argv != '-') {
-				Symbol newtype = {
-					.name = *argv,
-					.type = {.category = T_VOID},
-				};
-				(void)add_symbol(args, storage, newtype);	
-				argv++;
-			} else {
-				die2(args, "-t flag must be followed by a type name");
-			}
-			continue;
-		}
-
-		if (!strcmp(*argv, "-f")) {
-			argv++;
-
-			if(!emitted_preamble) {
-				emit_preamble(args); 
-				emitted_preamble = 1;
-			}
-
-			// we're expecting a filename to follow, or '-' to indicate stdin, but not another flag yet
-			if(*argv && (!strcmp(*argv, "-") || **argv != '-')) {
-
-				// This section does a lot of resetting of individual bits of the args struct.
-				// TODO: improve so that we can just memset a whole sub-struct to 0.
-				memset(&args.error_handling, 0, sizeof(args.error_handling));
-				args.filename = *argv;
-				read_file_with_includes(storage, args, 1<<27, text);
-				ntok = lex_file(storage, args, 1<<27, tokens, text, 0x10000, string_store);
-				clear_symbols(storage);
-				populate_symbols(
-					storage, 
-					(ParseCtx) {
-						.tokens_first  =  tokens,
-						.tokens        =  tokens,
-						.tokens_end    =  tokens+ntok,
-						.storage       =  storage,
-						.args          =  args, }
-					);
-				args.disable_pp = 0;
-				args.generic = 0;
-				args.generic_keep_trailing_underscore = 0;
-				enums_added_from_this_file = 0;
-				memset(&args.manual_include, 0, sizeof(args.manual_include));
-				argv++;
-			} else {
-				die2(args, "-f flag must be followed by a filename");
-			}
-			continue;
-		}
-
-		if (!strncmp(*argv, "-e,", 3)) {
-			char *c = *argv+3;
-			int nchars_read = 0;
-			int argno = xatoi(args, c, &nchars_read);
-			c += nchars_read+1;
-			if(c[-1] != ',') die2(args,"expected comma in argument '%s'", *argv);
-			args.error_handling.active = 1;
-			args.error_handling.argno = argno;
-			args.error_handling.fn = c;
-			argv++;
-			continue;
-		}
-
-		if (!strncmp(*argv, "-e", 2)) {
-			args.error_handling.active = 1;
-			args.error_handling.argno = 0;
-			args.error_handling.fn = 0;
-			argv++;
-			continue;	
-		}
-
-		if (**argv == '-') {
+		if ((*argv)[0] == '-' && (*argv)[1]) {
+			const char *repl = retired_flag_replacement(*argv);
+			if (repl) die2(args, "'%s' was removed in c-serpent v2: %s", *argv, repl);
 			fprintf(args.estream, "unrecognized flag: '%s'\n\n", *argv);
 			usage();
-			return 1;
+			_resources.success = 0;
+			goto cleanup;
 		}
 
-		/*
-			Run parser on token array.
-		*/
-
-		fnames[n_fnames++] = *argv;
-		if(n_fnames == COUNT_ARRAY(fnames)) 
-			die2(args, "error: c-serpent only supports wrapping up to  %i functions (including generic variants)", (int) COUNT_ARRAY(fnames));
-
-		ParseCtx p = {
-			.tokens_first  =  tokens,
-			.tokens        =  tokens,
-			.tokens_end    =  tokens+ntok,
-			.args          =  args,
-			.storage       =  storage,
-		};
-
-		Symbol argsyms[MAX_FN_ARGS] = {0};
-
-		if(args.generic) {
-
-			if ((*argv)[strlen(*argv)-1] == '_'  &&  !args.generic_keep_trailing_underscore) 
-				fname_needs_remove_underscore[n_fnames-1] = 1;
-
-			int n_variants_found = 0;
-			VariantSuffix variant_suffixes[] = {
-
-				/*
-					The order is important here.
-					For scalar arguments, the generated dispatcher will call
-					the first version that appears.
-				*/
-
-				{get_symbol_or_die(args, storage, "int64_t")->type, 'l'},
-				{get_symbol_or_die(args, storage, "int32_t")->type, 'i'},
-				{get_symbol_or_die(args, storage, "int16_t")->type, 's'},
-				{get_symbol_or_die(args, storage, "int8_t")->type,  'b'},
-
-				{get_symbol_or_die(args, storage, "uint64_t")->type, 'L'},
-				{get_symbol_or_die(args, storage, "uint32_t")->type, 'I'},
-				{get_symbol_or_die(args, storage, "uint16_t")->type, 'S'},
-				{get_symbol_or_die(args, storage, "uint8_t")->type,  'B'},
-
-				{(Type){.category=T_DOUBLE},  'd'},
-				{(Type){.category=T_FLOAT16}, 'h'},
-				{(Type){.category=T_FLOAT},   'f'},
-
-				{(Type){.category=T_DOUBLE, .is_complex=1},  'D'},
-				{(Type){.category=T_FLOAT16, .is_complex=1}, 'H'},
-				{(Type){.category=T_FLOAT, .is_complex=1},   'F'},
-			};
-
-
-			short arg_match_count[MAX_FN_ARGS] = {0}; 
-
-			for (int i = 0; i < COUNT_ARRAY(variant_suffixes); i++) {
-
-				char namebuf[500] = {0};	
-				snprintf(namebuf, sizeof(namebuf), "%s%c", *argv, variant_suffixes[i].suffix);
-
-				if (parse_file_look_for_function(p, namebuf, argsyms)) {
-
-					fnames[n_fnames++] = intern_string(args, storage, namebuf, 0) ;
-					if(n_fnames == COUNT_ARRAY(fnames)) 
-						die2(args, "error: c-serpent only supports wrapping up to  %i functions (including generic variants)", (int) COUNT_ARRAY(fnames));
-
-					variant_suffixes[i].found = 1;
-					n_variants_found++;
-
-					for (int j = 0; j < MAX_FN_ARGS; j++) {
-						arg_match_count[j] += compare_types_equal(argsyms[j].type, variant_suffixes[i].type, 0,0,0,0);
-					}
-				}
-			}
-
-			if (n_variants_found == 0) 
-				die2(args, "didn't find any variants of a function called '%s' in file '%s' that followed the required suffix convention", *argv, p.args.filename);
-
-			emit_dispatch_wrapper(p, *argv, n_variants_found, arg_match_count, COUNT_ARRAY(variant_suffixes), variant_suffixes, argsyms);
-
-
-		} else {
-
-			if(!parse_file_look_for_function(p, *argv, argsyms)) 
-				die2(args, "didn't find function called '%s' in file '%s'", *argv, p.args.filename);
-		}
-
+		if (ninputs == MAX_INPUTS) die2(args, "too many input files (max %i)", (int)MAX_INPUTS);
+		inputs[ninputs++] = *argv;
 		argv++;
 	}
 
-	emit_module(
-		args, 
-		n_fnames, 
-		fnames, 
-		fname_needs_remove_underscore,
-		num_enum_consts,
-		enum_const_names);
+	if (!ninputs) { usage(); _resources.success = 0; goto cleanup; }
+
+	/*
+		Pass 1: collate.
+
+		Preprocess, lex and scan each input for annotations, building the work
+		list and the enum tables. Nothing is emitted until this has all
+		succeeded, so a failure never leaves half a wrapper file on stdout.
+	*/
+
+	Loc module_loc = {0};
+
+	for (int i = 0; i < ninputs; i++) {
+
+		args.filename = inputs[i];
+		read_input(storage, args, 1<<27, text);
+
+		long long len = strlen(text);
+		char *cached = malloc(len+1);
+		if(!cached) die2(args, "out of mem");
+		memcpy(cached, text, len+1);
+		storage->cached[i] = cached;
+
+		int ntok = lex_file(storage, args, 1<<27, tokens, cached, 0x10000, string_store);
+
+		scan_annotations(storage, &args, ntok, tokens, i, 1, &module_loc);
+
+		clear_symbols(storage);
+		collect_enums((ParseCtx){
+				.tokens_first = tokens,
+				.tokens       = tokens,
+				.tokens_end   = tokens+ntok,
+				.storage      = storage,
+				.args         = args, },
+			storage);
+	}
+
+	/*
+		Validate the work list.
+	*/
+
+	if (!args.modulename)
+		warn_at(args, (Loc){.file=inputs[0], .line=0},
+			"no CSERPENT_MODULE found; emitting wrappers only, with no module definition");
+
+	// duplicate wraps: identical is fine and collapses, conflicting is not
+	for (int i = 0; i < storage->nitems; i++) {
+		if (storage->items[i].kind == WK_OPAQUE) continue;
+		for (int j = 0; j < i; j++) {
+			if (storage->items[j].kind != storage->items[i].kind) continue;
+			if (strcmp(storage->items[j].name, storage->items[i].name)) continue;
+			if (!wrapopts_equal(storage->items[j].opts, storage->items[i].opts))
+				die_at(args, storage->items[i].loc,
+					"'%s' is wrapped here with different options than at %s:%i",
+					storage->items[i].name,
+					storage->items[j].loc.file, storage->items[j].loc.line);
+			storage->items[i].kind = 0;   // identical duplicate: drop it
+			break;
+		}
+	}
+
+	// resolve CSERPENT_WRAPCONST names against every enum we saw
+	int num_enum_consts = 0;
+	char *enum_consts[MAX_EXPORTS];
+
+	for (int i = 0; i < storage->nitems; i++) {
+		if (storage->items[i].kind != WK_CONST) continue;
+		const char *want = storage->items[i].name;
+		Loc loc = storage->items[i].loc;
+
+		int as_tag = 0, as_member = 0;
+		for (int e = 0; e < storage->nenumconsts; e++) {
+			if (storage->enumconsts[e].tag[0] && !strcmp(storage->enumconsts[e].tag, want)) as_tag = 1;
+			if (!strcmp(storage->enumconsts[e].name, want)) as_member = 1;
+		}
+
+		if (as_tag && as_member)
+			die_at(args, loc, "'%s' is both an enum tag and an enum constant; "
+			       "c-serpent cannot tell which you meant", want);
+		if (!as_tag && !as_member)
+			die_at(args, loc, "CSERPENT_WRAPCONST: '%s' is not an enum tag or an enum constant "
+			       "(note that #defines cannot be wrapped)", want);
+
+		for (int e = 0; e < storage->nenumconsts; e++) {
+			const char *add = 0;
+			if (as_tag && storage->enumconsts[e].tag[0] && !strcmp(storage->enumconsts[e].tag, want))
+				add = storage->enumconsts[e].name;
+			else if (as_member && !strcmp(storage->enumconsts[e].name, want))
+				add = storage->enumconsts[e].name;
+			if (!add) continue;
+
+			int already = 0;
+			for (int k = 0; k < num_enum_consts; k++)
+				if (!strcmp(enum_consts[k], add)) { already = 1; break; }
+			if (already) continue;
+
+			if (num_enum_consts == COUNT_ARRAY(enum_consts))
+				die_at(args, loc, "too many module constants (max %i)", (int)COUNT_ARRAY(enum_consts));
+			enum_consts[num_enum_consts++] = (char*) add;
+		}
+	}
+
+	if (explain) {
+		fprintf(args.estream, "module: %s\n", args.modulename ? args.modulename : "(none: wrappers only)");
+		for (int i = 0; i < storage->nitems; i++) {
+			WrapItem *it = &storage->items[i];
+			if (!it->kind) continue;
+			fprintf(args.estream, "%s(%s)  [%s:%i]\n",
+				wrap_kind_name(it->kind), it->name, it->loc.file, it->loc.line);
+		}
+		fprintf(args.estream, "%i module constants\n", num_enum_consts);
+		goto cleanup;
+	}
+
+	/*
+		Pass 2: emit.
+	*/
+
+	emit_preamble(args);
+
+	for (int i = 0; i < ninputs; i++) {
+
+		args.filename = inputs[i];
+		args.opts = 0;
+
+		int ntok = lex_file(storage, args, 1<<27, tokens, storage->cached[i], 0x10000, string_store);
+		scan_annotations(storage, &args, ntok, tokens, i, 0, &module_loc);
+
+		// typedefs are per input; generic dispatch resolves int64_t and
+		// friends through this table, so it has to be rebuilt for each file.
+		clear_symbols(storage);
+		populate_symbols(storage, (ParseCtx){
+				.tokens_first = tokens,
+				.tokens       = tokens,
+				.tokens_end   = tokens+ntok,
+				.storage      = storage,
+				.args         = args, });
+
+		// CSERPENT_OPAQUE is output-global, so apply every one of them to
+		// every input's symbol table.
+		for (int k = 0; k < storage->nitems; k++) {
+			if (storage->items[k].kind != WK_OPAQUE) continue;
+			add_symbol(args, storage, (Symbol){
+				.name = (char*) storage->items[k].name,
+				.type = {.category = T_VOID},
+			});
+		}
+
+		for (int k = 0; k < storage->nitems; k++) {
+
+			WrapItem *it = &storage->items[k];
+			if (it->input != i) continue;
+
+			args.opts = &it->opts;
+
+			ParseCtx p = {
+				.tokens_first = tokens,
+				.tokens       = tokens,
+				.tokens_end   = tokens+ntok,
+				.storage      = storage,
+				.args         = args,
+			};
+
+			Symbol argsyms[MAX_FN_ARGS] = {0};
+
+			if (it->kind == WK_FN) {
+
+				if(!parse_file_look_for_function(p, it->name, argsyms))
+					die_at(args, it->loc, "no function called '%s' in '%s'", it->name, inputs[i]);
+				add_export(storage, args,
+					it->opts.py_name ? it->opts.py_name : it->name,
+					it->name, it->opts.doc);
+
+			} else if (it->kind == WK_MANUAL) {
+
+				add_export(storage, args,
+					it->opts.py_name ? it->opts.py_name : it->name,
+					it->name, it->opts.doc);
+
+			} else if (it->kind == WK_GENERIC) {
+
+				int n_variants_found = 0;
+				VariantSuffix variant_suffixes[] = {
+
+					/*
+						The order is important here.
+						For scalar arguments, the generated dispatcher will call
+						the first version that appears.
+					*/
+
+					{get_symbol_or_die(args, storage, "int64_t")->type, 'l'},
+					{get_symbol_or_die(args, storage, "int32_t")->type, 'i'},
+					{get_symbol_or_die(args, storage, "int16_t")->type, 's'},
+					{get_symbol_or_die(args, storage, "int8_t")->type,  'b'},
+
+					{get_symbol_or_die(args, storage, "uint64_t")->type, 'L'},
+					{get_symbol_or_die(args, storage, "uint32_t")->type, 'I'},
+					{get_symbol_or_die(args, storage, "uint16_t")->type, 'S'},
+					{get_symbol_or_die(args, storage, "uint8_t")->type,  'B'},
+
+					{(Type){.category=T_DOUBLE},  'd'},
+					{(Type){.category=T_FLOAT16}, 'h'},
+					{(Type){.category=T_FLOAT},   'f'},
+
+					{(Type){.category=T_DOUBLE, .is_complex=1},  'D'},
+					{(Type){.category=T_FLOAT16, .is_complex=1}, 'H'},
+					{(Type){.category=T_FLOAT, .is_complex=1},   'F'},
+				};
+
+				short arg_match_count[MAX_FN_ARGS] = {0};
+
+				for (int s = 0; s < COUNT_ARRAY(variant_suffixes); s++) {
+
+					char namebuf[500] = {0};
+					if (ssizeof(namebuf) <= snprintf(namebuf, sizeof(namebuf), "%s%c",
+							it->name, variant_suffixes[s].suffix))
+						die_at(args, it->loc, "function name too long");
+
+					if (parse_file_look_for_function(p, namebuf, argsyms)) {
+
+						char *vname = intern_string(args, storage, namebuf, 0);
+						add_export(storage, args, vname, vname, it->opts.doc);
+
+						variant_suffixes[s].found = 1;
+						n_variants_found++;
+
+						for (int j = 0; j < MAX_FN_ARGS; j++)
+							arg_match_count[j] += compare_types_equal(
+								argsyms[j].type, variant_suffixes[s].type, 0,0,0,0);
+					}
+				}
+
+				if (n_variants_found == 0)
+					die_at(args, it->loc, "found no variants of '%s' in '%s' following the "
+					       "suffix convention", it->name, inputs[i]);
+
+				emit_dispatch_wrapper(p, it->name, n_variants_found, arg_match_count,
+					COUNT_ARRAY(variant_suffixes), variant_suffixes, argsyms);
+
+				// the dispatcher is emitted as wrap_<prefix>; python sees the
+				// prefix with any trailing underscore removed by default
+				char dispname[500] = {0};
+				int dlen = snprintf(dispname, sizeof(dispname), "%s", it->name);
+				assert(ssizeof(dispname)-1 > dlen);
+				if (it->opts.strip_underscore != 0 && dlen && dispname[dlen-1] == '_')
+					dispname[dlen-1] = 0;
+
+				add_export(storage, args,
+					it->opts.py_name ? it->opts.py_name : intern_string(args, storage, dispname, 0),
+					it->name, it->opts.doc);
+			}
+
+			args.opts = 0;
+		}
+	}
+
+	emit_module(args, storage->nexports, storage->exports, num_enum_consts, enum_consts);
 
 	cleanup: // free memory
-	for(unsigned i = 0; i < sizeof(_resources.ptrs)/sizeof(_resources.ptrs[0]); i++) 
+	// read the storage pointer back out of the volatile record rather than
+	// from the local, whose value is indeterminate after longjmp
+	{
+		StorageBuffers *st = (StorageBuffers *) _resources.ptrs[3];
+		if (st) for (int i = 0; i < MAX_INPUTS; i++) free(st->cached[i]);
+	}
+	for(unsigned i = 0; i < sizeof(_resources.ptrs)/sizeof(_resources.ptrs[0]); i++)
 		free(_resources.ptrs[i]);
 	if(_resources.open_file) fclose(_resources.open_file);
 	return ! _resources.success; // rtn zero on success
