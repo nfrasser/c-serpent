@@ -1471,13 +1471,21 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
-		fprintf(args.ostream, "    return Py_BuildValue(\"");
-		if(!emit_py_buildvalue_fmt_char(args, rtntype)) {
-			die2(args, "Error wrapping function '%s' in file '%s': "
-			       "return type '%s' is not supported by c-serpent",
-			       fn, args.filename, buf);
+		if (rtntype.category == T_BOOL) {
+			/*
+				'p' is a PyArg_Parse predicate, not a Py_BuildValue format --
+				passing it to Py_BuildValue raises SystemError at runtime.
+			*/
+			fprintf(args.ostream, "    return PyBool_FromLong(rtn);\n");
+		} else {
+			fprintf(args.ostream, "    return Py_BuildValue(\"");
+			if(!emit_py_buildvalue_fmt_char(args, rtntype)) {
+				die2(args, "Error wrapping function '%s' in file '%s': "
+				       "return type '%s' is not supported by c-serpent",
+				       fn, args.filename, buf);
+			}
+			fprintf(args.ostream, "\", rtn);\n");
 		}
-		fprintf(args.ostream, "\", rtn);\n");
 	}
 
 	fprintf(args.ostream, "}\n\n");
@@ -3597,10 +3605,22 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 		// every input's symbol table.
 		for (int k = 0; k < storage->nitems; k++) {
 			if (storage->items[k].kind != WK_OPAQUE) continue;
-			add_symbol(args, storage, (Symbol){
-				.name = (char*) storage->items[k].name,
-				.type = {.category = T_VOID},
-			});
+
+			/*
+				Override any existing definition rather than shadowing it.
+				'typedef struct Ctx Ctx;' registers Ctx as a struct, and
+				get_symbol returns the first match, so appending a second
+				entry would leave the typedef winning and OPAQUE silently
+				doing nothing.
+			*/
+			Symbol *existing = get_symbol(storage, (char*) storage->items[k].name);
+			if (existing)
+				existing->type = (Type){.category = T_VOID};
+			else
+				add_symbol(args, storage, (Symbol){
+					.name = (char*) storage->items[k].name,
+					.type = {.category = T_VOID},
+				});
 		}
 
 		for (int k = 0; k < storage->nitems; k++) {

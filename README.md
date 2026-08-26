@@ -27,7 +27,10 @@ There are two ways to use C-serpent:
 - **For interactive development in Jupyter.** If you use Jupyter for
   interactive development, you can just write C code in a string within
   your notebook and use the machinery in cserpentmodule.py to compile and
-  run it on the fly. Live code re-loading is supported.
+  run it on the fly. Live code re-loading is supported. The annotations are
+  identical to the ones used here, so notebook code ports into a `.c` file by
+  copy and paste; the only addition is a `CSERPENT_MODULE` line, which the
+  notebook supplies for you. A `%%cserpent` cell magic is also registered.
   cserpentmodule assumes the compiler is gcc, but it should work with 
   clang as well if you override some default options. See cserpentmodule.py
   for details. MSVC is not currently supported.
@@ -38,7 +41,7 @@ There are two ways to use C-serpent:
   which improve the packaging and distribution are very, very welcome.
 
 The rest of this README focuses on C-serpent as a standalone program. 
-See NotebookExample.py to learn about using C-serpent interactively.
+See NotebookExample.ipynb to learn about using C-serpent interactively.
 
 C-serpent is not completely general-purpose:
 
@@ -107,6 +110,27 @@ For example on a unix-derivative,
 You can define `CSERPENT_DISABLE_ASSERT` to compile out assertions, if
 you wish to.
         
+Tests
+-----
+
+    $ python3 tests/run_tests.py
+
+There are three kinds. *Codegen* tests run C-serpent over a snippet and check
+what it emitted, or which error it produced; they need only a C compiler.
+*Functional* tests compile the generated wrapper into a real extension module,
+import it, and assert on actual behaviour. *Notebook* tests exercise
+`cserpentmodule.py`. The last two additionally need Python and numpy headers.
+
+If the Python running the tests lacks those headers, the functional tests are
+skipped with a message rather than failing. Point at one that has them with:
+
+    $ python3 tests/run_tests.py --python /path/to/venv/bin/python
+
+`-k PATTERN` runs a subset, `--keep` retains the temporary build directory, and
+`-v` lists each test as it passes. New cases are added as dicts in
+`tests/cases_codegen.py`, `tests/cases_functional.py` and
+`tests/cases_notebook.py`.
+
 Usage
 -----
 
