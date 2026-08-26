@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cserpent"
+version = "2.0.0"
+description = "Generate CPython extension wrappers for C functions, from annotations in the C source"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [{ name = "Harris M. Snyder", email = "harris.snyder@gmail.com" }]
+keywords = ["c", "bindings", "extension module", "numpy", "ffi", "codegen"]
+classifiers = [
+    "Programming Language :: C",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+    "Operating System :: POSIX",
+    "Operating System :: MacOS",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/hsnyder/c-serpent"
+
+# 'pip install cserpent' gives you both 'import cserpent' and this command.
+# The extension module contains the whole code generator, so the command line
+# program is a shim over it rather than a separate binary.
+[project.scripts]
+cserpent = "cserpent:main"
+
+[tool.setuptools]
+py-modules = ["cserpent"]
+
+# The extension itself is declared in setup.py. Declaring ext-modules here is
+# still experimental in setuptools, and this is the one thing that genuinely
+# needs the imperative form.

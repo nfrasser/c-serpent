@@ -16,8 +16,8 @@ There are three kinds of test:
              import it and assert on real behaviour. Needs Python headers and
              numpy headers as well.
 
-  notebook   exercise cserpentmodule.py, which reaches c-serpent through the
-             cserpent_py extension rather than the standalone binary.
+  notebook   exercise cserpent.py, which reaches c-serpent through the
+             _cserpent extension rather than the standalone binary.
 
 The last two are skipped, loudly, if no suitable Python is available.
 Pass --python to point at one (a virtualenv or conda env usually has the
@@ -168,8 +168,8 @@ def run_notebook_case(workdir, case, python, incs, shim):
     d = os.path.join(workdir, case["name"])
     os.makedirs(d, exist_ok=True)
 
-    shutil.copy(shim, os.path.join(d, "cserpent_py.so"))
-    shutil.copy(os.path.join(ROOT, "cserpentmodule.py"), d)
+    shutil.copy(shim, os.path.join(d, "_cserpent.so"))
+    shutil.copy(os.path.join(ROOT, "cserpent.py"), d)
 
     script = os.path.join(d, "check.py")
     with open(script, "w") as f:
@@ -182,11 +182,32 @@ def run_notebook_case(workdir, case, python, incs, shim):
 
 def build_cserpent_py(workdir, incs):
     """Build the cserpent_py extension, or return None if it will not build."""
-    so = os.path.join(workdir, "cserpent_py.so")
+    so = os.path.join(workdir, "_cserpent.so")
     r = subprocess.run([CC, "-fPIC", "-shared", "-I" + incs[0],
                         os.path.join(ROOT, "cserpent_py.c"), "-o", so],
                        capture_output=True, text=True)
     return so if r.returncode == 0 else None
+
+
+def check_versions(exe):
+    """pyproject.toml, cserpent.py and cserpent.c must all say the same thing."""
+    import re
+
+    with open(os.path.join(ROOT, "pyproject.toml")) as f:
+        proj = re.search(r'^version\s*=\s*"([^"]+)"', f.read(), re.M)
+    with open(os.path.join(ROOT, "cserpent.py")) as f:
+        pyv = re.search(r'^__version__\s*=\s*"([^"]+)"', f.read(), re.M)
+
+    r = subprocess.run([exe, "--version"], capture_output=True, text=True)
+    cliv = r.stdout.strip().split()[-1] if r.returncode == 0 else None
+
+    found = {
+        "pyproject.toml": proj.group(1) if proj else None,
+        "cserpent.py": pyv.group(1) if pyv else None,
+        "cserpent.c --version": cliv,
+    }
+    if len(set(found.values())) != 1 or None in found.values():
+        raise Failure("version strings disagree: %r" % found)
 
 
 def main():
@@ -254,6 +275,16 @@ def main():
             except Failure as e:
                 failed += 1
                 failures.append((case["name"], str(e)))
+
+        # the version appears in three places; make drift a test failure
+        try:
+            check_versions(exe)
+            passed += 1
+            if opts.verbose:
+                print("  ok      versions_agree")
+        except Failure as e:
+            failed += 1
+            failures.append(("versions_agree", str(e)))
 
         for name, msg in failures:
             print("FAIL  %s\n      %s\n" % (name, msg.replace("\n", "\n      ")))

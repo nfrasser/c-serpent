@@ -1,0 +1,14 @@
+# cserpent_py.c #includes these, so they must be in the source distribution
+# even though they are not listed as extension sources.
+include cserpent.c
+include stb_c_lexer.h
+
+include LICENSE
+include README.md
+include Makefile
+include NotebookExample.ipynb
+graft tests
+
+global-exclude *.pyc
+prune tests/__pycache__
+prune __pycache__

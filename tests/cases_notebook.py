@@ -1,8 +1,8 @@
 '''
-Tests for the notebook path (cserpentmodule.py).
+Tests for the notebook path (cserpent.py).
 
 These are built differently from the other functional tests: the notebook path
-calls c-serpent through the cserpent_py extension module rather than the
+calls c-serpent through the _cserpent extension module rather than the
 standalone binary, so the harness compiles cserpent_py.c against the target
 Python first. Skipped along with the other functional tests when no suitable
 Python is available.
@@ -11,8 +11,8 @@ Each case is a dict:
 
     name    test name, also the temp subdirectory
     test    python source, run with the temp directory as the working directory
-            and cserpent_py.so and cserpentmodule.py alongside it. It should
-            raise on failure, so plain asserts are enough.
+            and _cserpent.so and cserpent.py alongside it. It should raise on
+            failure, so plain asserts are enough.
 '''
 
 CASES = [
@@ -21,9 +21,9 @@ CASES = [
          test=r'''
 import sys
 sys.path.insert(0, ".")
-import cserpentmodule
+import cserpent
 
-m = cserpentmodule.CSerpentModule("nbt", working_dir=".")
+m = cserpent.CSerpentModule("nbt", working_dir=".")
 
 code = """
 #include <stdint.h>
@@ -59,9 +59,9 @@ assert nbt.twice(21) == 63
          test=r'''
 import sys
 sys.path.insert(0, ".")
-import cserpentmodule
+import cserpent
 
-m = cserpentmodule.CSerpentModule("nbi", working_dir=".")
+m = cserpent.CSerpentModule("nbi", working_dir=".")
 
 # An annotation outside an '#ifdef CSERPENT' block has to fail here exactly as
 # it would in a .c file: the two interfaces are meant to be identical, so that
@@ -69,7 +69,7 @@ m = cserpentmodule.CSerpentModule("nbi", working_dir=".")
 try:
     m.compile("int f(void){return 1;}\nCSERPENT_WRAPFN(f)\n", quiet=True)
     raise AssertionError("expected CSerpentError for a bare annotation")
-except cserpentmodule.CSerpentError as e:
+except cserpent.CSerpentError as e:
     assert "#ifdef CSERPENT" in str(e), e
 
 # The module name is the one thing the notebook supplies, so a cell must not
@@ -81,7 +81,7 @@ try:
               "CSERPENT_WRAPFN(g)\n"
               "#endif\n", quiet=True)
     raise AssertionError("expected CSerpentError for a cell-supplied module name")
-except cserpentmodule.CSerpentError as e:
+except cserpent.CSerpentError as e:
     assert "supplied automatically" in str(e), e
 '''),
 ]

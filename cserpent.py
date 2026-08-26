@@ -15,9 +15,9 @@ line; that is the whole porting story.
 
 EXAMPLE USAGE
 
-    import cserpentmodule
+    import cserpent
 
-    m = cserpentmodule.CSerpentModule('my_module')
+    m = cserpent.CSerpentModule('my_module')
     my_module = m.compile("""
         #include <stdint.h>
 
@@ -47,7 +47,7 @@ EXAMPLE USAGE
 
 IN IPYTHON OR JUPYTER
 
-    A cell magic is registered automatically, which saves the string quoting
+    Importing cserpent registers a cell magic, which saves the string quoting
     and binds the module into your namespace under the name you give it:
 
         %%cserpent my_module
@@ -63,7 +63,7 @@ IN IPYTHON OR JUPYTER
 
 PREREQUISITES
 
-    - The c-serpent extension module. Install with 'pip install cserpent', or
+    - The _cserpent extension module. 'pip install cserpent' provides it, or
       build it yourself; see the comments at the top of cserpent_py.c.
 
     - A C compiler whose preprocessor can write to stdout, which in practice
@@ -76,8 +76,10 @@ import subprocess
 import sys
 import sysconfig
 
-import cserpent_py
-import numpy
+import _cserpent
+
+__version__ = "2.0.0"
+
 
 
 class CSerpentError(Exception):
@@ -157,6 +159,9 @@ class CSerpentModule:
                 linkdirs    = list(linkdirs)    + _env_list('CSERPENT_EXTRA_LINKDIRS')
                 linkflags   = list(linkflags)   + _env_list('CSERPENT_EXTRA_LINKFLAGS')
 
+                # imported here rather than at module scope so that the
+                # command line program does not require numpy to be installed
+                import numpy
                 includedirs += [sysconfig.get_paths()['include'], numpy.get_include()]
 
                 # 1. preprocess, with CSERPENT defined so that any '#ifdef
@@ -194,7 +199,7 @@ class CSerpentModule:
                 # 3. generate the wrappers
 
                 cserpent_args = ["-W"] + list(extra_cserpent_flags) + ["-"]
-                rc, out, err = cserpent_py.run_cserpent(cserpent_args, preprocessed_code)
+                rc, out, err = _cserpent.run_cserpent(cserpent_args, preprocessed_code)
 
                 if err and not quiet:
                         print(err, file=sys.stderr)
@@ -298,3 +303,35 @@ def _register_magic():
 
 
 _register_magic()
+
+
+# --------------------------------------------------------------------------
+# Command line entry point
+# --------------------------------------------------------------------------
+
+def main(argv=None):
+        '''
+        The 'cserpent' command. The extension module contains the whole code
+        generator, so the command line program is a shim over the same C code
+        that the notebook path uses -- there is no separate binary to build.
+        '''
+        argv = list(sys.argv[1:] if argv is None else argv)
+
+        if "--version" in argv:
+                print("c-serpent " + __version__)
+                return 0
+
+        # c-serpent opens input files itself; '-' means it wants stdin
+        stdin_text = sys.stdin.read() if "-" in argv else ""
+
+        rc, out, err = _cserpent.run_cserpent(argv, stdin_text)
+
+        if out:
+                sys.stdout.write(out)
+        if err:
+                sys.stderr.write(err)
+        return rc
+
+
+if __name__ == "__main__":
+        sys.exit(main())

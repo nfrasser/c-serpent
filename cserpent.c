@@ -17,6 +17,8 @@
 #define STB_C_LEXER_IMPLEMENTATION
 #include "stb_c_lexer.h"
 
+#define CSERPENT_VERSION_STRING "2.0.0"
+
 #define MAX_FN_ARGS 40
 #define MAX_DIRS 40
 #define MAX_FILES 40
@@ -3163,6 +3165,8 @@ usage(void)
 	"                                                                             \n"
 	"-h          print this message and exit \n"
 	"                                                                             \n"
+	"--version   print the version and exit \n"
+	"                                                                             \n"
 	"-p CMD      preprocessor command, default 'cc -E'. Also settable with the    \n"
 	"            CSERPENT_PP environment variable; the flag takes precedence.     \n"
 	"            Include directories go here, e.g. -p \"cc -E -Ivendor/include\".   \n"
@@ -3379,6 +3383,11 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 	while (*argv) {
 
 		if (!strcmp(*argv, "-h")) { usage(); goto cleanup; }
+
+		if (!strcmp(*argv, "--version")) {
+			fprintf(args.ostream, "c-serpent %s\n", CSERPENT_VERSION_STRING);
+			goto cleanup;
+		}
 
 		if (!strcmp(*argv, "-v")) { args.verbose  = 1; argv++; continue; }
 		if (!strcmp(*argv, "-W")) { args.warnings = 1; argv++; continue; }

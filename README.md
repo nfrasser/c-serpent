@@ -26,19 +26,14 @@ There are two ways to use C-serpent:
 
 - **For interactive development in Jupyter.** If you use Jupyter for
   interactive development, you can just write C code in a string within
-  your notebook and use the machinery in cserpentmodule.py to compile and
+  your notebook and use the machinery in cserpent.py to compile and
   run it on the fly. Live code re-loading is supported. The annotations are
   identical to the ones used here, so notebook code ports into a `.c` file by
   copy and paste; the only addition is a `CSERPENT_MODULE` line, which the
   notebook supplies for you. A `%%cserpent` cell magic is also registered.
-  cserpentmodule assumes the compiler is gcc, but it should work with 
-  clang as well if you override some default options. See cserpentmodule.py
+  cserpent.py assumes the compiler is gcc, but it should work with
+  clang as well if you override some default options. See cserpent.py
   for details. MSVC is not currently supported.
-
-  *March 2024:* C-Serpent is now available on PyPI, and can be installed with 
-  `pip install cserpent`. It is distributed as a *source package,* so you
-  will need a compiler and python development headers available. Contributions 
-  which improve the packaging and distribution are very, very welcome.
 
 The rest of this README focuses on C-serpent as a standalone program. 
 See NotebookExample.ipynb to learn about using C-serpent interactively.
@@ -99,10 +94,30 @@ The resulting wrapper will accept a Python integer for `N`, and either `None`
 or a numpy array with `dtype=numpy.int32` for `array`. An exception will
 be raised if the supplied types don't match. 
 
+Installing
+----------
+
+    $ pip install cserpent
+
+That gives you both the `cserpent` command and `import cserpent` for the
+notebook workflow; they are the same code generator, so there is no separate
+binary to build. It is a *source package*, so you need a C compiler and Python
+development headers (`python3-dev` or `python3-devel`) to install it.
+
+If you only want the command line program, you do not need pip at all:
+
+    $ make                  # builds ./cserpent
+    $ make test             # runs the regression tests
+    $ sudo make install     # copies it to /usr/local/bin
+
+And if you would rather vendor it, `cserpent.c` and `stb_c_lexer.h` are a
+self-contained pair — drop them in your tree and compile `cserpent.c`. That is
+a supported way to use it, not a workaround.
+
 Compiling
 ---------
 
-To build C-serpent, just point your C compiler at cserpent.c. 
+To build C-serpent by hand, just point your C compiler at cserpent.c.
 For example on a unix-derivative, 
 
     $ cc -g cserpent.c -o cserpent 
@@ -119,7 +134,7 @@ There are three kinds. *Codegen* tests run C-serpent over a snippet and check
 what it emitted, or which error it produced; they need only a C compiler.
 *Functional* tests compile the generated wrapper into a real extension module,
 import it, and assert on actual behaviour. *Notebook* tests exercise
-`cserpentmodule.py`. The last two additionally need Python and numpy headers.
+`cserpent.py`. The last two additionally need Python and numpy headers.
 
 If the Python running the tests lacks those headers, the functional tests are
 skipped with a message rather than failing. Point at one that has them with:
