@@ -274,6 +274,56 @@ Annotations
         the generated code into the same translation unit as the enum, or
         prepend an `#include` of the relevant header to the output.
 
+    CSERPENT_WRAPTYPE(name, options...)
+
+        Wrap a struct or union as a Python class. `name` may be a struct tag or
+        a typedef name, including the `typedef struct { ... } Foo;` form.
+
+            fields = (a, b)     expose only these members
+            exclude = (c)       expose all but these; not usable with `fields`
+            readonly = 1        make every member read-only
+            readonly = (a, b)   make these members read-only
+            doc = "str"         docstring for the type
+
+        Scalar members are readable and writable. **Everything else is
+        read-only**, and is mutated through the view it returns:
+
+            m.origin.x = 7      # nested struct member, writes through
+            m.coeffs[:] = ...   # fixed-size array member, a numpy view
+
+        Pointer members are read-only with no exception: a `char *` reads as a
+        `str`, a pointer to another wrapped struct reads as an instance of it,
+        and anything else reads as an integer address. To *set* one, write a C
+        setter and wrap it, which is safer than accepting a raw address because
+        it goes through C-serpent's usual type checking:
+
+            void config_set_data(struct Config *c, int32_t *d) { c->data = d; }
+
+        `struct Foo *` as an argument means one struct, not an array: it accepts
+        a `Foo` instance, or `None` for a null pointer. `struct Foo` by value
+        works as both argument and return. Returning `struct Foo *` is also
+        supported; C is assumed to own that memory, and a NULL return becomes
+        `None`.
+
+        Every instance has a read-only `.address` giving the underlying pointer
+        as an int, and an `.invalidate()` method to mark it dead once C has
+        freed it. A call that frees its argument can say so, so that use after
+        free raises instead of reading freed memory:
+
+            CSERPENT_WRAPFN(matrix_free, invalidates = 1)
+
+        (`invalidates` counts arguments from 1.)
+
+        Bitfields are not supported and produce a parse error naming the
+        member. Members of any other type C-serpent cannot represent are an
+        error too, naming the member and suggesting `exclude`.
+
+        Note that the emitted wrapper code needs to be able to see the struct
+        definition, exactly as it does for enum constants. Either use
+        `CSERPENT_CONFIG(declarations = 0)` and compile the generated code in
+        the same translation unit as the definition, or prepend an `#include`
+        of the relevant header to the output.
+
     CSERPENT_OPAQUE(TypeName)
 
         Treat `TypeName` as equivalent to `void`, so that pointers to it are

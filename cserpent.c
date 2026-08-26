@@ -70,6 +70,20 @@ typedef struct type {
 	unsigned short is_pointer_const    : 1;
 	unsigned short is_pointer_restrict : 1;
 	unsigned short is_pointer_volatile : 1;
+	/*
+		Set for a struct member declared as a fixed-size array. Function
+		parameters decay to pointers instead, so this is only ever set when
+		parsing a struct body.
+	*/
+	unsigned short is_fixed_array      : 1;
+	/*
+		Set when 'tag' is a typedef name for an untagged struct, as in
+		'typedef struct { ... } Point;'. There is no 'struct Point' to name in
+		that case -- the C spelling is just 'Point'.
+	*/
+	unsigned short tag_is_typedef      : 1;
+	/* tag of a struct/union type, interned; null otherwise */
+	const char *tag;
 } Type;
 
 
@@ -114,10 +128,18 @@ typedef struct {
 	const char *doc;
 	const char *errcheck;
 	int          errarg;
+	int          invalidates;   /* 1-based argument index, 0 = none */
 	signed char  errstr;
 	signed char  addresses;
 	signed char  bytes;
 	signed char  strip_underscore;
+	/*
+		CSERPENT_WRAPTYPE lists, as (start, count) into the shared name pool.
+		readonly_n == -1 means every member is read-only.
+	*/
+	int fields_at,   fields_n;
+	int exclude_at,  exclude_n;
+	int readonly_at, readonly_n;
 } WrapOpts;
 
 enum wrap_kind {
@@ -126,6 +148,7 @@ enum wrap_kind {
 	WK_MANUAL,
 	WK_CONST,
 	WK_OPAQUE,
+	WK_TYPE,
 };
 
 typedef struct {
@@ -133,6 +156,7 @@ typedef struct {
 	const char *name;
 	WrapOpts  opts;
 	int       input;   /* index into the input file list */
+	int       def;     /* index into StorageBuffers.structdefs, WK_TYPE only */
 	Loc       loc;
 } WrapItem;
 
@@ -180,6 +204,17 @@ opt_or_cfg(signed char item, ConfigVal cfg, int fallback)
 }
 
 enum {
+	MAX_STRUCT_MEMBERS = 100,
+	MAX_WRAPPED_TYPES  = 64,
+};
+
+typedef struct {
+	int    nmembers;
+	Symbol members[MAX_STRUCT_MEMBERS];
+	char   cspelling[200];  /* how to name the type in emitted C */
+} StructDef;
+
+enum {
 	MAX_STRINGS_EXP=17,
 	MAX_STRING_HEAP=(1<<24),
 	MAX_SYMBOLS=10000,
@@ -188,6 +223,7 @@ enum {
 	MAX_ENUMCONSTS=40000,
 	MAX_EXPORTS=4000,
 	MAX_INPUTS=200,
+	MAX_NAMELIST=4000,
 };
 
 /* one enum constant, with the tag of the enum it belongs to ("" if anonymous) */
@@ -235,6 +271,14 @@ typedef struct {
 	// Module method table, built in pass 2
 	int nexports;
 	Export exports[MAX_EXPORTS];
+
+	// Shared pool for parenthesised name lists in annotations
+	int nnamelist;
+	const char *namelist[MAX_NAMELIST];
+
+	// Parsed struct/union definitions, one per CSERPENT_WRAPTYPE
+	int nstructdefs;
+	StructDef structdefs[MAX_WRAPPED_TYPES];
 
 	// Preprocessed text of each input, kept between passes. stdin can only be
 	// read once, and re-running cpp per pass would be wasteful anyway.
@@ -296,8 +340,17 @@ repr_type(int bufsz, char buf[], Type type)
 	char *is_pointer_restrict = type.is_pointer_restrict ? "restrict " : "";
 	char *is_pointer_volatile = type.is_pointer_volatile ? "volatile " : "";
 
-	return snprintf(buf, bufsz, "%s%s%s %s%s%s%s%s%s%s%s%s", 
-		is_signed, is_unsigned, type_category_strings[type.category], is_complex, is_imaginary,
+	/* 'struct' and 'union' are only half a type name; the tag is the rest */
+	const char *category = type_category_strings[type.category];
+	char tagbuf[200] = {0};
+	if (type.tag && (type.category == T_STRUCT || type.category == T_UNION)) {
+		if (type.tag_is_typedef) category = type.tag;
+		else snprintf(tagbuf, sizeof(tagbuf), " %s", type.tag);
+	}
+
+	return snprintf(buf, bufsz, "%s%s%s%s %s%s%s%s%s%s%s%s%s",
+		is_signed, is_unsigned, category, tagbuf,
+		is_complex, is_imaginary,
 		is_const, is_restrict, is_volatile, is_pointer,
 		is_pointer_const, is_pointer_restrict, is_pointer_volatile);
 }
@@ -405,7 +458,10 @@ die2 (CSerpentArgs args, const char * fmt, ...)
 	terminate(&args);
 }
 
-static uint64_t 
+/* defined with the annotation scanner, but needed by the emitters above it */
+static _Noreturn void die_at (CSerpentArgs args, Loc loc, const char * fmt, ...);
+
+static uint64_t
 hash (char *s, int32_t len)
 {
 	uint64_t h = 0x100;
@@ -775,6 +831,7 @@ compare_types_equal(Type a, Type b, int compare_pointer, int compare_const, int 
 static void
 emit_module(
 	CSerpentArgs args,
+	StorageBuffers *st,
 	int n_exports,
 	Export exports[],
 	int num_enum_consts,
@@ -819,6 +876,18 @@ emit_module(
 	"	if (!(m = PyModule_Create(&module_def))) \n"
 	"		return NULL; \n"
 	" \n", args.modulename);
+
+	for (int t = 0; t < st->nitems; t++) {
+		if (st->items[t].kind != WK_TYPE) continue;
+		const char *n = st->items[t].name;
+		fprintf(args.ostream,
+		"	if (PyType_Ready(&cs_%s_Type) < 0) return NULL; \n"
+		"	Py_INCREF(&cs_%s_Type); \n"
+		"	if (PyModule_AddObject(m, \"%s\", (PyObject*)&cs_%s_Type) < 0) { \n"
+		"		Py_DECREF(&cs_%s_Type); \n"
+		"		return NULL; \n"
+		"	} \n", n, n, n, n, n);
+	}
 
 	for(int e = 0; e < num_enum_consts; e++) {
 		fprintf(args.ostream, "	PyModule_AddIntConstant(m, \"%s\", %s);\n", enum_consts[e], enum_consts[e]);
@@ -942,6 +1011,93 @@ basetype(Type t)
 	return t;
 }
 
+enum member_kind {
+	MK_UNSUPPORTED = 0,
+	MK_SCALAR,      /* int, double, ... */
+	MK_BOOL,
+	MK_STRING,      /* char *                          */
+	MK_STRUCTVAL,   /* nested wrapped struct, by value  */
+	MK_STRUCTPTR,   /* pointer to a wrapped struct      */
+	MK_ARRAY,       /* fixed-size array of scalars      */
+	MK_POINTER,     /* any other pointer, incl. function pointers */
+};
+
+static int
+wrapped_type_index(StorageBuffers *st, const char *name)
+{
+	if (!name) return -1;
+	for (int i = 0; i < st->nitems; i++)
+		if (st->items[i].kind == WK_TYPE && !strcmp(st->items[i].name, name))
+			return i;
+	return -1;
+}
+
+static int
+classify_member(StorageBuffers *st, Type t)
+{
+	int is_struct = (t.category == T_STRUCT || t.category == T_UNION);
+	int wrapped   = is_struct && wrapped_type_index(st, t.tag) >= 0;
+	int plain_num = t.category >= T_CHAR && t.category <= T_DOUBLE
+			&& !t.is_complex && !t.is_imaginary;
+
+	if (t.is_fixed_array)
+		return (!t.is_pointer && plain_num) ? MK_ARRAY : MK_UNSUPPORTED;
+
+	if (t.is_pointer) {
+		if (is_string(t))  return MK_STRING;
+		if (wrapped)       return MK_STRUCTPTR;
+		return MK_POINTER;
+	}
+
+	if (t.category == T_BOOL) return MK_BOOL;
+	if (wrapped)              return MK_STRUCTVAL;
+	if (plain_num)            return MK_SCALAR;
+	return MK_UNSUPPORTED;
+}
+
+static int
+member_visible(StorageBuffers *st, WrapOpts o, const char *m)
+{
+	if (o.fields_n) {
+		for (int i = 0; i < o.fields_n; i++)
+			if (!strcmp(st->namelist[o.fields_at+i], m)) return 1;
+		return 0;
+	}
+	for (int i = 0; i < o.exclude_n; i++)
+		if (!strcmp(st->namelist[o.exclude_at+i], m)) return 0;
+	return 1;
+}
+
+static int
+member_readonly(StorageBuffers *st, WrapOpts o, const char *m)
+{
+	if (o.readonly_n < 0) return 1;
+	for (int i = 0; i < o.readonly_n; i++)
+		if (!strcmp(st->namelist[o.readonly_at+i], m)) return 1;
+	return 0;
+}
+
+/*
+	'invalidates = N' marks the N-th argument (1-based) dead after the call,
+	so that using a struct whose memory C has just freed raises rather than
+	reading freed memory.
+*/
+static void
+emit_invalidations(CSerpentArgs args, int n_fnargs, Symbol fnargs[])
+{
+	const WrapOpts *o = args.opts;
+	if (!o || !o->invalidates) return;
+
+	if (o->invalidates > n_fnargs)
+		die2(args, "invalidates = %i was given, but the function only has %i arguments",
+			o->invalidates, n_fnargs);
+
+	const char *nm = fnargs[o->invalidates-1].name;
+	fprintf(args.ostream,
+		"    if (%s_obj != Py_None) ((cs_%s_Object*)%s_obj)->p = NULL;\n",
+		nm, fnargs[o->invalidates-1].type.tag, nm);
+}
+
 static void 
 emit_exceptionhandling(const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[])
 {
@@ -975,15 +1131,19 @@ emit_exceptionhandling(const char *fn, CSerpentArgs args, int n_fnargs, Symbol f
 	}
 }
 
-static void 
-emit_call(const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[])
+static void
+emit_call(const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, Symbol fnargs[])
 {
 	fprintf(args.ostream, "%s (", fn);
 
 	for(int i = 0; i < n_fnargs; i++)
 	{
 		char *sep  =  i ? ", " : "";
-		if (is_array(fnargs[i].type)) {
+		int mk = classify_member(st, fnargs[i].type);
+		if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
+			/* already unpacked into a local of the right type */
+			fprintf(args.ostream, "%s%s", sep, fnargs[i].name);
+		} else if (is_array(fnargs[i].type)) {
 			char buffer[200] = {0};
 			if(200 <= repr_type(200, buffer, fnargs[i].type)) 
 				die2(args, "bug: buffer overflow / type name too long");
@@ -1015,8 +1175,8 @@ emit_py_buildvalue_fmt_char(CSerpentArgs args, Type t)
 	return 1;
 }
 
-static void 
-emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], Type rtntype)
+static void
+emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, Symbol fnargs[], Type rtntype)
 {
 	assert(n_fnargs >= 0);
 
@@ -1065,7 +1225,20 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 		for(int i = 0; i < n_fnargs; i++) {
 			Symbol arg = fnargs[i];
 
-			if (is_string(arg.type)) {
+			int mk = classify_member(st, arg.type);
+
+			if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
+				char tb[200] = {0};
+				Type bt = basetype(arg.type);
+				repr_type(sizeof(tb), tb, bt);
+				fprintf(args.ostream, "    PyObject *%s_obj = NULL;\n", arg.name);
+				if (mk == MK_STRUCTPTR)
+					fprintf(args.ostream, "    %s *%s = NULL;\n", tb, arg.name);
+				else
+					fprintf(args.ostream, "    %s %s;\n", tb, arg.name);
+			}
+
+			else if (is_string(arg.type)) {
 				fprintf(args.ostream, "    char * %s = 0;\n", arg.name);
 			}
 
@@ -1096,7 +1269,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 			// building the format string for ParseTupleAndKeywords
 			Symbol arg = fnargs[i];
 
-			if      (is_string(arg.type))  fprintf(args.ostream, "z");
+			int mk = classify_member(st, arg.type);
+
+			if      (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) fprintf(args.ostream, "O");
+			else if (is_string(arg.type))  fprintf(args.ostream, "z");
 			else if (is_voidptr(arg.type)) fprintf(args.ostream, "K");
 			else if (is_array(arg.type))   fprintf(args.ostream, "O");
 			else {
@@ -1119,7 +1295,11 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 			fprintf(args.ostream, ",\n        ");
 			Symbol arg = fnargs[i];
 
-			if      (is_string(arg.type))  fprintf(args.ostream, "&%s", arg.name);
+			int mk = classify_member(st, arg.type);
+
+			if      (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL)
+			                               fprintf(args.ostream, "&%s_obj", arg.name);
+			else if (is_string(arg.type))  fprintf(args.ostream, "&%s", arg.name);
 			else if (is_voidptr(arg.type)) fprintf(args.ostream, "&%s_ull", arg.name);
 			else if (is_array(arg.type))   fprintf(args.ostream, "&%s_obj", arg.name);
 			else  fprintf(args.ostream, "&%s", arg.name);
@@ -1132,7 +1312,25 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 		{
 			Symbol arg = fnargs[i];
 
-			if (is_voidptr(arg.type)) 
+			int mk = classify_member(st, arg.type);
+
+			if (mk == MK_STRUCTPTR) {
+				fprintf(args.ostream,
+					"    if (!cs_%s_ptr(%s_obj, \"%s\", 1, &%s)) return 0;\n",
+					arg.type.tag, arg.name, arg.name, arg.name);
+			}
+
+			else if (mk == MK_STRUCTVAL) {
+				char tb[200] = {0};
+				repr_type(sizeof(tb), tb, basetype(arg.type));
+				fprintf(args.ostream,
+					"    { %s *_tmp = NULL;\n"
+					"      if (!cs_%s_ptr(%s_obj, \"%s\", 0, &_tmp)) return 0;\n"
+					"      %s = *_tmp; }\n",
+					tb, arg.type.tag, arg.name, arg.name, arg.name);
+			}
+
+			else if (is_voidptr(arg.type))
 				fprintf(args.ostream, "    memcpy(&%s, &%s_ull, sizeof(%s));\n", arg.name, arg.name, arg.name);
 
 			else if (is_array(arg.type)) {
@@ -1187,8 +1385,9 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 
 		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
 		fprintf(args.ostream, "    ");
-		emit_call(fn, args, n_fnargs, fnargs);
+		emit_call(fn, args, st, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_RETURN_NONE;\n");
 
@@ -1200,8 +1399,9 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 		fprintf(args.ostream, "    %s rtn = 0;\n", buf);
 		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
 		fprintf(args.ostream, "    rtn = ");
-		emit_call(fn, args, n_fnargs, fnargs);
+		emit_call(fn, args, st, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return Py_BuildValue(\"s\", rtn);\n");
 
@@ -1213,10 +1413,38 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 		fprintf(args.ostream, "    %s rtn = 0;\n", buf);
 		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
 		fprintf(args.ostream, "    rtn = ");
-		emit_call(fn, args, n_fnargs, fnargs);
+		emit_call(fn, args, st, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return PyLong_FromVoidPtr(rtn);\n");
+
+	} else if (classify_member(st, rtntype) == MK_STRUCTPTR
+		|| classify_member(st, rtntype) == MK_STRUCTVAL) {
+
+		int byval = classify_member(st, rtntype) == MK_STRUCTVAL;
+		char buf[200] = {0};
+		repr_type(sizeof(buf), buf, byval ? rtntype : basetype(rtntype));
+
+		fprintf(args.ostream, "    %s%s rtn;\n", buf, byval ? "" : " *");
+		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		fprintf(args.ostream, "    rtn = ");
+		emit_call(fn, args, st, n_fnargs, fnargs);
+		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
+		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
+
+		if (byval) {
+			/* copy out into a fresh object that owns its storage */
+			fprintf(args.ostream,
+			"    PyObject *_out = cs_%s_new_owned();\n"
+			"    if (!_out) return 0;\n"
+			"    ((cs_%s_Object*)_out)->v = rtn;\n"
+			"    return _out;\n", rtntype.tag, rtntype.tag);
+		} else {
+			/* C owns it; NULL becomes None */
+			fprintf(args.ostream, "    return cs_%s_from_ptr(rtn, NULL, 1);\n", rtntype.tag);
+		}
 
 	} else if (is_array(rtntype)) {
 
@@ -1239,8 +1467,9 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 
 		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
 		fprintf(args.ostream, "    rtn = ");
-		emit_call(fn, args, n_fnargs, fnargs);
+		emit_call(fn, args, st, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return Py_BuildValue(\"");
 		if(!emit_py_buildvalue_fmt_char(args, rtntype)) {
@@ -1255,7 +1484,328 @@ emit_wrapper (const char *fn, CSerpentArgs args, int n_fnargs, Symbol fnargs[], 
 
 }
 
-static void 
+/*
+	==========================================================
+		Struct/union wrapping
+	==========================================================
+*/
+
+/*
+	Forward declarations, emitted for every wrapped type before any
+	implementation, so that types can refer to one another.
+*/
+static void
+emit_struct_decl(CSerpentArgs args, const char *name, const char *cspelling)
+{
+	fprintf(args.ostream,
+	"typedef struct { \n"
+	"    PyObject_HEAD \n"
+	"    %s *p;         /* what to read and write through */ \n"
+	"    PyObject *owner; /* non-null only when we are a view into another object */ \n"
+	"    int external;    /* 1 = C owns *p */ \n"
+	"    %s v;          /* backing storage, used only when we own it */ \n"
+	"} cs_%s_Object; \n"
+	"static PyTypeObject cs_%s_Type; \n"
+	"static PyObject *cs_%s_from_ptr(%s *p, PyObject *owner, int external); \n"
+	"static int cs_%s_ptr(PyObject *o, const char *argname, int allow_none, %s **out); \n"
+	"\n",
+	cspelling, cspelling, name, name, name, cspelling, name, cspelling);
+}
+
+static void
+emit_struct_impl(CSerpentArgs args, StorageBuffers *st, const char *name,
+                 const char *cspelling, StructDef *def, WrapOpts o, Loc loc)
+{
+	/* constructors and the argument-unpacking helper */
+
+	fprintf(args.ostream,
+	"static PyObject * \n"
+	"cs_%s_from_ptr(%s *p, PyObject *owner, int external) \n"
+	"{ \n"
+	"    if (!p) Py_RETURN_NONE; \n"
+	"    cs_%s_Object *self = PyObject_New(cs_%s_Object, &cs_%s_Type); \n"
+	"    if (!self) return NULL; \n"
+	"    self->p = p; self->owner = owner; self->external = external; \n"
+	"    Py_XINCREF(owner); \n"
+	"    return (PyObject*)self; \n"
+	"} \n\n"
+	"static PyObject * \n"
+	"cs_%s_new_owned(void) \n"
+	"{ \n"
+	"    cs_%s_Object *self = PyObject_New(cs_%s_Object, &cs_%s_Type); \n"
+	"    if (!self) return NULL; \n"
+	"    memset(&self->v, 0, sizeof(self->v)); \n"
+	"    self->p = &self->v; self->owner = NULL; self->external = 0; \n"
+	"    return (PyObject*)self; \n"
+	"} \n\n"
+	"static int \n"
+	"cs_%s_ptr(PyObject *o, const char *argname, int allow_none, %s **out) \n"
+	"{ \n"
+	"    if (o == Py_None) { \n"
+	"        if (allow_none) { *out = NULL; return 1; } \n"
+	"    } else if (PyObject_TypeCheck(o, &cs_%s_Type)) { \n"
+	"        cs_%s_Object *s = (cs_%s_Object*)o; \n"
+	"        if (!s->p) { \n"
+	"            PyErr_Format(PyExc_ValueError, \"argument '%%s' has been invalidated\", argname); \n"
+	"            return 0; \n"
+	"        } \n"
+	"        *out = s->p; \n"
+	"        return 1; \n"
+	"    } \n"
+	"    PyErr_Format(PyExc_TypeError, \"argument '%%s' must be a %s%%s\", argname, allow_none ? \" or None\" : \"\"); \n"
+	"    return 0; \n"
+	"} \n\n"
+	"static void \n"
+	"cs_%s_dealloc(PyObject *o) \n"
+	"{ \n"
+	"    cs_%s_Object *s = (cs_%s_Object*)o; \n"
+	"    Py_XDECREF(s->owner); \n"
+	"    PyObject_Del(o); \n"
+	"} \n\n"
+	"static PyObject * \n"
+	"cs_%s_invalidate(PyObject *o, PyObject *unused) \n"
+	"{ \n"
+	"    (void) unused; \n"
+	"    ((cs_%s_Object*)o)->p = NULL; \n"
+	"    Py_RETURN_NONE; \n"
+	"} \n\n"
+	"static PyObject * \n"
+	"cs_%s_get_address(PyObject *o, void *closure) \n"
+	"{ \n"
+	"    (void) closure; \n"
+	"    return PyLong_FromVoidPtr((void*)((cs_%s_Object*)o)->p); \n"
+	"} \n\n",
+	name, cspelling, name, name, name,
+	name, name, name, name,
+	name, cspelling, name, name, name, name,
+	name, name, name,
+	name, name,
+	name, name);
+
+	/* one getter, and where allowed one setter, per visible member */
+
+	for (int i = 0; i < def->nmembers; i++) {
+
+		Symbol m = def->members[i];
+		if (!member_visible(st, o, m.name)) continue;
+
+		int kind = classify_member(st, m.type);
+		char tbuf[200] = {0};
+		repr_type(sizeof(tbuf), tbuf, m.type);
+
+		if (kind == MK_UNSUPPORTED)
+			die_at(args, loc, "CSERPENT_WRAPTYPE(%s): member '%s' has type '%s', "
+			       "which c-serpent cannot represent. Use exclude = (%s) to skip it.",
+			       name, m.name, tbuf, m.name);
+
+		fprintf(args.ostream,
+		"static PyObject * \n"
+		"cs_%s_get_%s(PyObject *o, void *closure) \n"
+		"{ \n"
+		"    (void) closure; \n"
+		"    cs_%s_Object *s = (cs_%s_Object*)o; \n"
+		"    if (!s->p) { PyErr_SetString(PyExc_ValueError, \"%s object has been invalidated\"); return NULL; } \n",
+		name, m.name, name, name, name);
+
+		switch (kind) {
+		case MK_SCALAR: {
+			fprintf(args.ostream, "    return Py_BuildValue(\"");
+			if (!emit_py_buildvalue_fmt_char(args, m.type))
+				die_at(args, loc, "CSERPENT_WRAPTYPE(%s): member '%s' has type '%s', "
+				       "which c-serpent cannot convert to python",
+				       name, m.name, tbuf);
+			fprintf(args.ostream, "\", s->p->%s); \n", m.name);
+		} break;
+
+		case MK_BOOL:
+			fprintf(args.ostream, "    return PyBool_FromLong(s->p->%s); \n", m.name);
+			break;
+
+		case MK_STRING:
+			fprintf(args.ostream,
+			"    if (!s->p->%s) Py_RETURN_NONE; \n"
+			"    return PyUnicode_FromString(s->p->%s); \n", m.name, m.name);
+			break;
+
+		case MK_STRUCTVAL:
+			/* a view, so that outer.inner.x = 5 writes through */
+			fprintf(args.ostream, "    return cs_%s_from_ptr(&s->p->%s, o, 0); \n",
+				m.type.tag, m.name);
+			break;
+
+		case MK_STRUCTPTR:
+			fprintf(args.ostream, "    return cs_%s_from_ptr(s->p->%s, NULL, 1); \n",
+				m.type.tag, m.name);
+			break;
+
+		case MK_POINTER:
+			fprintf(args.ostream, "    return PyLong_FromVoidPtr((void*)s->p->%s); \n", m.name);
+			break;
+
+		case MK_ARRAY: {
+			/*
+				sizeof recovers the extent at C compile time, so c-serpent
+				never has to evaluate the array bound itself.
+			*/
+			char base[200] = {0};
+			Type bt = basetype(m.type);
+			bt.is_fixed_array = 0;
+			repr_type(sizeof(base), base, bt);
+			fprintf(args.ostream,
+			"    npy_intp dims[1] = { (npy_intp)(sizeof(s->p->%s)/sizeof(s->p->%s[0])) }; \n"
+			"    PyObject *arr = PyArray_SimpleNewFromData(1, dims, C2NPY(%s), s->p->%s); \n"
+			"    if (!arr) return NULL; \n"
+			"    Py_INCREF(o); \n"
+			"    if (PyArray_SetBaseObject((PyArrayObject*)arr, o) < 0) { Py_DECREF(arr); return NULL; } \n"
+			"    return arr; \n", m.name, m.name, base, m.name);
+		} break;
+		}
+
+		fprintf(args.ostream, "} \n\n");
+
+		/* Only scalars are writable; everything else is mutated through the
+		   view it returns, or through a C setter the user wraps. */
+		int writable = (kind == MK_SCALAR || kind == MK_BOOL)
+				&& !member_readonly(st, o, m.name);
+
+		if (writable) {
+			fprintf(args.ostream,
+			"static int \n"
+			"cs_%s_set_%s(PyObject *o, PyObject *val, void *closure) \n"
+			"{ \n"
+			"    (void) closure; \n"
+			"    cs_%s_Object *s = (cs_%s_Object*)o; \n"
+			"    if (!s->p) { PyErr_SetString(PyExc_ValueError, \"%s object has been invalidated\"); return -1; } \n"
+			"    if (!val) { PyErr_SetString(PyExc_TypeError, \"cannot delete attribute '%s'\"); return -1; } \n",
+			name, m.name, name, name, name, m.name);
+
+			if (kind == MK_BOOL) {
+				fprintf(args.ostream,
+				"    int tmp = PyObject_IsTrue(val); \n"
+				"    if (tmp < 0) return -1; \n"
+				"    s->p->%s = tmp; \n"
+				"    return 0; \n} \n\n", m.name);
+			} else {
+				fprintf(args.ostream, "    %s tmp = 0; \n    if (!PyArg_Parse(val, \"", tbuf);
+				emit_py_buildvalue_fmt_char(args, m.type);
+				fprintf(args.ostream,
+				"\", &tmp)) return -1; \n"
+				"    s->p->%s = tmp; \n"
+				"    return 0; \n} \n\n", m.name);
+			}
+		}
+	}
+
+	/* repr, over the scalar members only */
+
+	fprintf(args.ostream,
+	"static PyObject * \n"
+	"cs_%s_repr(PyObject *o) \n"
+	"{ \n"
+	"    cs_%s_Object *s = (cs_%s_Object*)o; \n"
+	"    if (!s->p) return PyUnicode_FromString(\"<%s invalidated>\"); \n"
+	"    PyObject *r = PyUnicode_FromString(\"<%s\"); \n"
+	"    if (!r) return NULL; \n", name, name, name, name, name);
+
+	for (int i = 0; i < def->nmembers; i++) {
+		Symbol m = def->members[i];
+		if (!member_visible(st, o, m.name)) continue;
+		int kind = classify_member(st, m.type);
+		if (kind != MK_SCALAR && kind != MK_BOOL) continue;
+		fprintf(args.ostream,
+		"    { \n"
+		"        PyObject *v = cs_%s_get_%s(o, NULL); \n"
+		"        if (!v) { Py_DECREF(r); return NULL; } \n"
+		"        PyObject *t = PyUnicode_FromFormat(\" %s=%%R\", v); \n"
+		"        Py_DECREF(v); \n"
+		"        if (!t) { Py_DECREF(r); return NULL; } \n"
+		"        PyObject *n = PyUnicode_Concat(r, t); \n"
+		"        Py_DECREF(r); Py_DECREF(t); r = n; \n"
+		"        if (!r) return NULL; \n"
+		"    } \n", name, m.name, m.name);
+	}
+
+	fprintf(args.ostream,
+	"    { \n"
+	"        PyObject *t = PyUnicode_FromString(\">\"); \n"
+	"        if (!t) { Py_DECREF(r); return NULL; } \n"
+	"        PyObject *n = PyUnicode_Concat(r, t); \n"
+	"        Py_DECREF(r); Py_DECREF(t); r = n; \n"
+	"    } \n"
+	"    return r; \n"
+	"} \n\n");
+
+	/* construction: zero-initialised, with keyword arguments routed through
+	   the ordinary setters so unknown or read-only members raise normally */
+
+	fprintf(args.ostream,
+	"static PyObject * \n"
+	"cs_%s_tp_new(PyTypeObject *t, PyObject *a, PyObject *k) \n"
+	"{ \n"
+	"    (void) t; (void) a; (void) k; \n"
+	"    return cs_%s_new_owned(); \n"
+	"} \n\n"
+	"static int \n"
+	"cs_%s_tp_init(PyObject *self, PyObject *a, PyObject *k) \n"
+	"{ \n"
+	"    if (a && PyTuple_Size(a)) { \n"
+	"        PyErr_SetString(PyExc_TypeError, \"%s() takes keyword arguments only\"); \n"
+	"        return -1; \n"
+	"    } \n"
+	"    if (!k) return 0; \n"
+	"    PyObject *key, *val; \n"
+	"    Py_ssize_t pos = 0; \n"
+	"    while (PyDict_Next(k, &pos, &key, &val)) \n"
+	"        if (PyObject_SetAttr(self, key, val) < 0) return -1; \n"
+	"    return 0; \n"
+	"} \n\n", name, name, name, name);
+
+	/* method and getset tables, and the type object itself */
+
+	fprintf(args.ostream,
+	"static PyMethodDef cs_%s_methods[] = { \n"
+	"    {\"invalidate\", cs_%s_invalidate, METH_NOARGS, \"Mark dead after C has freed it.\"}, \n"
+	"    { NULL, NULL, 0, NULL } \n"
+	"}; \n\n"
+	"static PyGetSetDef cs_%s_getset[] = { \n"
+	"    {(char*)\"address\", cs_%s_get_address, NULL, (char*)\"the underlying pointer, as an int\", NULL}, \n",
+	name, name, name, name);
+
+	for (int i = 0; i < def->nmembers; i++) {
+		Symbol m = def->members[i];
+		if (!member_visible(st, o, m.name)) continue;
+		int kind = classify_member(st, m.type);
+		int writable = (kind == MK_SCALAR || kind == MK_BOOL)
+				&& !member_readonly(st, o, m.name);
+		char setter[300] = "NULL";
+		if (writable) snprintf(setter, sizeof(setter), "cs_%s_set_%s", name, m.name);
+
+		fprintf(args.ostream,
+		"    {(char*)\"%s\", cs_%s_get_%s, %s, (char*)\"\", NULL}, \n",
+		m.name, name, m.name, setter);
+	}
+
+	fprintf(args.ostream,
+	"    { NULL, NULL, NULL, NULL, NULL } \n"
+	"}; \n\n"
+	"static PyTypeObject cs_%s_Type = { \n"
+	"    PyVarObject_HEAD_INIT(NULL, 0) \n"
+	"    .tp_name = \"%s\", \n"
+	"    .tp_basicsize = sizeof(cs_%s_Object), \n"
+	"    .tp_dealloc = cs_%s_dealloc, \n"
+	"    .tp_repr = cs_%s_repr, \n"
+	"    .tp_flags = Py_TPFLAGS_DEFAULT, \n"
+	"    .tp_doc = \"%s\", \n"
+	"    .tp_methods = cs_%s_methods, \n"
+	"    .tp_getset = cs_%s_getset, \n"
+	"    .tp_init = cs_%s_tp_init, \n"
+	"    .tp_new = cs_%s_tp_new, \n"
+	"}; \n\n",
+	name, name, name, name, name,
+	o.doc ? o.doc : "", name, name, name, name);
+}
+
+static void
 emit_dispatch_wrapper (
 	ParseCtx p,
 	const char *fn, 
@@ -1451,6 +2001,24 @@ supported_type(ParseCtx *p, Type *t)
 
 	else if (p->tokens[0].toktype == CLEX_id) {
 
+		/*
+			'struct'/'union' are only half a type name, so grab the tag too.
+			An untagged one (as in 'typedef struct { ... } Foo;') leaves the
+			tag null; the caller's SAVE/RESTORE unwinds if it then fails.
+		*/
+		if (eat_identifier(p, "struct")) {
+			modify_type_struct(p,t);
+			char *tag = 0;
+			if (identifier(p, &tag) && t) t->tag = tag;
+			return 1;
+		}
+		if (eat_identifier(p, "union")) {
+			modify_type_union(p,t);
+			char *tag = 0;
+			if (identifier(p, &tag) && t) t->tag = tag;
+			return 1;
+		}
+
 		if (eat_identifier(p, "void"))     { modify_type_void(p,t); return 1; }
 		if (eat_identifier(p, "char"))     { modify_type_char(p,t); return 1; } 
 		if (eat_identifier(p, "short"))    { modify_type_short(p,t); return 1; }
@@ -1498,7 +2066,50 @@ supported_typedef(ParseCtx *p, Symbol *s)
 		if(!strcmp(tmp.name, "union"))  { RESTORE(p); return 0; }
 		if(!strcmp(tmp.name, "enum"))   { RESTORE(p); return 0; }
 		*s = tmp;
-		return 1; 
+		return 1;
+	}
+
+	RESTORE(p);
+
+	/*
+		'typedef struct [tag] { ... } Name;'. The body is skipped rather than
+		parsed -- CSERPENT_WRAPTYPE does that separately -- but Name has to be
+		registered here, or later uses of it as a member or parameter type
+		will not parse. Its tag is recorded as Name itself, so that the name
+		in the annotation and the name in a signature resolve to one identity.
+	*/
+	{
+		Symbol tmp2 = *s;
+		int is_union = 0;
+
+		if (eat_identifier(p, "typedef")
+			&& (eat_identifier(p, "struct") || (is_union = eat_identifier(p, "union"))))
+		{
+			identifier(p, 0);   /* optional tag */
+
+			if (p->tokens != p->tokens_end && p->tokens[0].toktype == '{') {
+
+				int depth = 0;
+				while (p->tokens != p->tokens_end) {
+					if (p->tokens[0].toktype == '{') depth++;
+					if (p->tokens[0].toktype == '}') {
+						depth--;
+						if (!depth) { p->tokens++; break; }
+					}
+					p->tokens++;
+				}
+
+				if (identifier(p, &tmp2.name) && eat_token(p, ';')) {
+					tmp2.type = (Type){
+						.category = is_union ? T_UNION : T_STRUCT,
+						.tag = tmp2.name,
+						.tag_is_typedef = 1,
+					};
+					*s = tmp2;
+					return 1;
+				}
+			}
+		}
 	}
 
 	RESTORE(p);
@@ -1533,8 +2144,17 @@ populate_symbols(StorageBuffers *storage, ParseCtx p)
 }
 
 
-static int 
-arg(ParseCtx *p, const char *fn, Symbol *fnarg, int fatal)
+/*
+	Parses one 'type name' declaration. Used for both function parameters and
+	struct members; they differ only in what '[...]' means. A parameter
+	declared as an array decays to a pointer, so decay_arrays is 1 there. A
+	struct member does not decay -- it is storage inline in the struct -- so
+	decay_arrays is 0 and the member is flagged as a fixed array instead. The
+	extent is never evaluated: emitted code uses sizeof to recover it, the
+	same trick that keeps c-serpent out of the business of knowing the ABI.
+*/
+static int
+arg(ParseCtx *p, const char *fn, Symbol *fnarg, int fatal, int decay_arrays)
 {
 	SAVE(p);
 
@@ -1553,11 +2173,12 @@ arg(ParseCtx *p, const char *fn, Symbol *fnarg, int fatal)
 	}
 
 	if(eat_token(p,'[')) {
-		if(!modify_type_pointer(p, &tmp.type)) {
+		if(decay_arrays ? !modify_type_pointer(p, &tmp.type) : tmp.type.is_pointer) {
 			if(fatal) die(p, "error wrapping function '%s' in '%s': unsupported type", fn, p->args.filename);
 			RESTORE(p);
 			return 0;
 		}
+		if(!decay_arrays) tmp.type.is_fixed_array = 1;
 		while(1) {
 			if (eat_identifier(p, "static")) {}
 			else if (eat_identifier(p, "const")) {modify_type_const(p, &tmp.type);}
@@ -1601,7 +2222,7 @@ arglist(ParseCtx *p, const char *fn, int max_args, int *num_args, Symbol fnargs[
 
 	if (eat_token(p, '('))
 	{
-		while(arg(p, fn, fnargs+(*num_args), fatal)) 
+		while(arg(p, fn, fnargs+(*num_args), fatal, 1))
 		{
 			*num_args = *num_args + 1;
 			if(eat_token(p, ',') && (*num_args == max_args))
@@ -1683,7 +2304,7 @@ process_function(ParseCtx p, Symbol argsyms[static MAX_FN_ARGS])
 		die(&p, "error wrapping function '%s' in '%s': parse error (encountered unrecognized garbage)", fn, p.args.filename);
 
 	// Parse successful, emit the wrapper!
-	emit_wrapper (fn, p.args, num_args, argsyms, rtn_t);
+	emit_wrapper (fn, p.args, p.storage, num_args, argsyms, rtn_t);
 }
 
 static void 
@@ -1717,6 +2338,105 @@ parse_file_look_for_function(ParseCtx p, const char *function_name, Symbol argsy
 	return 0;
 }
 
+
+/*
+	Parse '{ member; member; ... }', with p.tokens on the '{'.
+	Members are parsed with the same routine as function parameters, minus
+	array decay. Anything c-serpent cannot express -- bitfields, several
+	declarators in one statement -- falls out as a parse error naming the
+	member, which is the intended behaviour rather than an oversight.
+*/
+static int
+struct_body(ParseCtx *p, const char *name, StructDef *out)
+{
+	if(!eat_token(p, '{')) return 0;
+
+	out->nmembers = 0;
+
+	while(1) {
+		if(p->tokens == p->tokens_end)
+			die(p, "error wrapping '%s' in '%s': unexpected end of file in member list", name, p->args.filename);
+
+		if(eat_token(p, '}')) break;
+		if(eat_token(p, ';')) continue;   /* stray semicolon */
+
+		if(out->nmembers == MAX_STRUCT_MEMBERS)
+			die(p, "error wrapping '%s' in '%s': more than %i members are not supported",
+				name, p->args.filename, (int)MAX_STRUCT_MEMBERS);
+
+		arg(p, name, out->members + out->nmembers, 1, 0);
+		out->nmembers++;
+
+		if(!eat_token(p, ';'))
+			die(p, "error wrapping '%s' in '%s': expected ';' after member '%s'. "
+			    "Note that c-serpent does not support bitfields, or declaring "
+			    "several members in one statement",
+			    name, p->args.filename, out->members[out->nmembers-1].name);
+	}
+
+	return 1;
+}
+
+/*
+	Find a struct or union definition, by tag or by typedef name. Both forms
+	matter: 'typedef struct { ... } Foo;' is common enough that looking only
+	in the tag namespace would be useless.
+*/
+static int
+parse_file_look_for_struct(ParseCtx p, const char *name, StructDef *out)
+{
+	long len = strlen(name);
+
+	while (p.tokens != p.tokens_end) {
+
+		/* 'struct Foo { ... }' */
+		if ((check_token_is_identifier(p.tokens, "struct", 6)
+			|| check_token_is_identifier(p.tokens, "union", 5))
+			&& p.tokens+2 < p.tokens_end
+			&& check_token_is_identifier(p.tokens+1, name, len)
+			&& p.tokens[2].toktype == '{')
+		{
+			snprintf(out->cspelling, sizeof(out->cspelling), "%s %s",
+				check_token_is_identifier(p.tokens, "union", 5) ? "union" : "struct", name);
+			ParseCtx q = p;
+			q.tokens += 2;
+			return struct_body(&q, name, out);
+		}
+
+		/* 'typedef struct [tag] { ... } Foo;' -- the name comes after the body */
+		if (check_token_is_identifier(p.tokens, "typedef", 7)) {
+			ParseCtx q = p;
+			q.tokens++;
+			if (eat_identifier(&q, "struct") || eat_identifier(&q, "union")) {
+				identifier(&q, 0);   /* optional tag */
+				if (q.tokens != q.tokens_end && q.tokens[0].toktype == '{') {
+
+					ParseCtx body = q;
+
+					int depth = 0;
+					while (q.tokens != q.tokens_end) {
+						if (q.tokens[0].toktype == '{') depth++;
+						if (q.tokens[0].toktype == '}') {
+							depth--;
+							if (!depth) { q.tokens++; break; }
+						}
+						q.tokens++;
+					}
+
+					char *tdname = 0;
+					if (identifier(&q, &tdname) && !strcmp(tdname, name)) {
+						snprintf(out->cspelling, sizeof(out->cspelling), "%s", name);
+						return struct_body(&body, name, out);
+					}
+				}
+			}
+		}
+
+		advance_and_skip_braced_blocks(&p);
+	}
+
+	return 0;
+}
 
 static int
 process_enum(ParseCtx p, StorageBuffers *st)
@@ -1805,7 +2525,14 @@ enum { MAX_ANN_ARGS = 64 };
 
 typedef struct {
 	const char *key;   /* NULL for a positional argument */
-	Token       val;
+	Token       val;   /* single-token value */
+	/*
+		A parenthesised value, as in 'fields = (rows, cols)', is kept as a
+		token range rather than copied, so AnnArg stays small enough to be a
+		stack array.
+	*/
+	int         list_start;  /* token index of '(', or -1 */
+	int         list_end;    /* token index of ')' */
 } AnnArg;
 
 static Loc
@@ -1859,11 +2586,28 @@ parse_ann_args(CSerpentArgs args, Loc loc, const char *macro,
 		if (i >= ntok) die_at(args, loc, "%s: unterminated argument list", macro);
 		if (n == MAX_ANN_ARGS) die_at(args, loc, "%s: too many arguments", macro);
 
+		out[n].list_start = -1;
+		out[n].list_end   = -1;
+
 		if (tokens[i].toktype == CLEX_id && i+1 < ntok && tokens[i+1].toktype == '=') {
 			if (i+2 >= ntok) die_at(args, loc, "%s: expected a value after '='", macro);
 			out[n].key = tokens[i].string;
-			out[n].val = tokens[i+2];
-			i += 3;
+
+			if (tokens[i+2].toktype == '(') {
+				int j = i+2, depth = 0;
+				while (j < ntok) {
+					if (tokens[j].toktype == '(') depth++;
+					if (tokens[j].toktype == ')') { depth--; if(!depth) break; }
+					j++;
+				}
+				if (j >= ntok) die_at(args, loc, "%s: unterminated list after '%s ='", macro, out[n].key);
+				out[n].list_start = i+2;
+				out[n].list_end   = j;
+				i = j+1;
+			} else {
+				out[n].val = tokens[i+2];
+				i += 3;
+			}
 		} else {
 			out[n].key = 0;
 			out[n].val = tokens[i];
@@ -1913,6 +2657,35 @@ ann_bool(CSerpentArgs args, Loc loc, const char *macro, const char *what, Token 
 	return v;
 }
 
+/*
+	Copy a parenthesised name list into the shared pool, returning its start
+	index and filling *count. Pooled because WrapOpts is stored per item and
+	must stay small.
+*/
+static int
+ann_list(StorageBuffers *st, CSerpentArgs args, Loc loc, const char *macro,
+         const char *key, Token *tokens, AnnArg a, int *count)
+{
+	if (a.list_start < 0)
+		die_at(args, loc, "%s: '%s' must be a parenthesised list, e.g. (a, b)", macro, key);
+
+	int at = st->nnamelist;
+	int n  = 0;
+
+	for (int i = a.list_start+1; i < a.list_end; i++) {
+		if (tokens[i].toktype == ',') continue;
+		if (tokens[i].toktype != CLEX_id)
+			die_at(args, loc, "%s: '%s' must be a list of names", macro, key);
+		if (st->nnamelist == MAX_NAMELIST)
+			die_at(args, loc, "too many names in annotation lists (max %i)", (int)MAX_NAMELIST);
+		st->namelist[st->nnamelist++] = tokens[i].string;
+		n++;
+	}
+
+	*count = n;
+	return at;
+}
+
 static void
 set_config(CSerpentArgs *args, ConfigVal *cv, const char *key, int v, Loc loc, int or_together)
 {
@@ -1931,7 +2704,7 @@ set_config(CSerpentArgs *args, ConfigVal *cv, const char *key, int v, Loc loc, i
 
 static void
 handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc loc,
-                  int na, AnnArg a[], int input_index, Loc *module_loc)
+                  int na, AnnArg a[], Token *tokens, int input_index, Loc *module_loc)
 {
 	int is_fn      = !strcmp(macro, "CSERPENT_WRAPFN");
 	int is_generic = !strcmp(macro, "CSERPENT_WRAPFN_GENERIC");
@@ -1940,8 +2713,10 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 	int is_module  = !strcmp(macro, "CSERPENT_MODULE");
 	int is_config  = !strcmp(macro, "CSERPENT_CONFIG");
 	int is_opaque  = !strcmp(macro, "CSERPENT_OPAQUE");
+	int is_type    = !strcmp(macro, "CSERPENT_WRAPTYPE");
 
-	if (!(is_fn || is_generic || is_manual || is_const || is_module || is_config || is_opaque))
+	if (!(is_fn || is_generic || is_manual || is_const || is_module || is_config
+		|| is_opaque || is_type))
 		die_at(*args, loc, "unknown annotation '%s'", macro);
 
 	if (is_module) {
@@ -2003,6 +2778,23 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 		if (is_const || is_opaque)
 			die_at(*args, loc, "%s takes names only, not options", macro);
 
+		if (is_type) {
+			/* CSERPENT_WRAPTYPE has its own option set */
+			if      (!strcmp(key, "fields"))
+				o.fields_at  = ann_list(st, *args, loc, macro, key, tokens, a[k], &o.fields_n);
+			else if (!strcmp(key, "exclude"))
+				o.exclude_at = ann_list(st, *args, loc, macro, key, tokens, a[k], &o.exclude_n);
+			else if (!strcmp(key, "readonly")) {
+				if (a[k].list_start >= 0)
+					o.readonly_at = ann_list(st, *args, loc, macro, key, tokens, a[k], &o.readonly_n);
+				else if (ann_bool(*args, loc, macro, key, a[k].val))
+					o.readonly_n = -1;   /* every member */
+			}
+			else if (!strcmp(key, "doc")) o.doc = ann_string(*args, loc, macro, key, a[k].val);
+			else die_at(*args, loc, "%s: unknown option '%s'", macro, key);
+			continue;
+		}
+
 		if      (!strcmp(key, "name"))     o.py_name   = ann_string(*args, loc, macro, key, a[k].val);
 		else if (!strcmp(key, "doc"))      o.doc       = ann_string(*args, loc, macro, key, a[k].val);
 		else if (!strcmp(key, "errcheck")) o.errcheck  = ann_ident (*args, loc, macro, key, a[k].val);
@@ -2013,6 +2805,11 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 			o.errarg = ann_int(*args, loc, macro, key, a[k].val);
 			saw_errarg = 1;
 			if (o.errarg < 0) die_at(*args, loc, "%s: errarg must not be negative", macro);
+		}
+		else if (!strcmp(key, "invalidates")) {
+			o.invalidates = ann_int(*args, loc, macro, key, a[k].val);
+			if (o.invalidates < 1)
+				die_at(*args, loc, "%s: invalidates is a 1-based argument index", macro);
 		}
 		else if (!strcmp(key, "strip_underscore")) {
 			if (!is_generic)
@@ -2026,20 +2823,24 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 		die_at(*args, loc, "%s: expected at least one name", macro);
 	if (is_generic && nnames != 1)
 		die_at(*args, loc, "CSERPENT_WRAPFN_GENERIC takes exactly one prefix");
+	if (is_type && nnames != 1)
+		die_at(*args, loc, "CSERPENT_WRAPTYPE takes exactly one type name");
+	if (is_type && o.fields_n && o.exclude_n)
+		die_at(*args, loc, "CSERPENT_WRAPTYPE: 'fields' and 'exclude' cannot both be given");
 	if (o.py_name && nnames > 1)
 		die_at(*args, loc, "%s: 'name' cannot be used with more than one name", macro);
 	if (saw_errarg && !o.errcheck)
 		warn_at(*args, loc, "%s: 'errarg' has no effect without 'errcheck'", macro);
 
 	int kind = is_fn ? WK_FN : is_generic ? WK_GENERIC : is_manual ? WK_MANUAL
-	         : is_const ? WK_CONST : WK_OPAQUE;
+	         : is_const ? WK_CONST : is_type ? WK_TYPE : WK_OPAQUE;
 
 	for (int k = 0; k < nnames; k++) {
 		if (st->nitems == MAX_ITEMS)
 			die_at(*args, loc, "too many annotations (max %i)", (int)MAX_ITEMS);
 		st->items[st->nitems++] = (WrapItem){
 			.kind = kind, .name = names[k], .opts = o,
-			.input = input_index, .loc = loc,
+			.input = input_index, .def = -1, .loc = loc,
 		};
 	}
 }
@@ -2065,7 +2866,7 @@ scan_annotations(StorageBuffers *st, CSerpentArgs *args, int ntok, Token *tokens
 		int end = parse_ann_args(*args, loc, macro, tokens, ntok, i+1, &na, a);
 
 		if (collect)
-			handle_annotation(st, args, macro, loc, na, a, input_index, module_loc);
+			handle_annotation(st, args, macro, loc, na, a, tokens, input_index, module_loc);
 
 		for (int k = i; k < end; k++) tokens[k].toktype = ';';
 		i = end - 1;
@@ -2404,6 +3205,28 @@ usage(void)
 	"    Anything else is an error: #defines do not survive preprocessing and so  \n"
 	"    cannot be checked. \n"
 	"                                                                             \n"
+	"CSERPENT_WRAPTYPE(name, options...) \n"
+	"    Wrap a struct or union as a python class. 'name' may be a struct tag  \n"
+	"    or a typedef name. Scalar members are readable and writable; every    \n"
+	"    other kind of member is read-only and mutated through the view it     \n"
+	"    returns (obj.inner.x = 5, obj.arr[:] = ...), or through a C setter    \n"
+	"    function that you write and wrap. \n"
+	"      fields = (a, b)     expose only these members \n"
+	"      exclude = (c)       expose all but these; not usable with 'fields'  \n"
+	"      readonly = 1        make every member read-only \n"
+	"      readonly = (a, b)   make these members read-only \n"
+	"      doc = \"str\"         docstring for the type \n"
+	"                                                                               \n"
+	"    'struct Foo *' as an argument means one struct, not an array: it takes \n"
+	"    a Foo instance, or None for a null pointer. Returning 'struct Foo *' is \n"
+	"    supported; C is assumed to own that memory, and a null return becomes  \n"
+	"    None. Each object also has a read-only '.address' and an .invalidate() \n"
+	"    method, for use after C frees the memory. \n"
+	"                                                                               \n"
+	"    Note that the emitted wrapper code needs to see the struct definition, \n"
+	"    the same way it needs to see enum constants: either assemble it into   \n"
+	"    the same translation unit, or prepend the relevant #include. \n"
+	"                                                                               \n"
 	"CSERPENT_OPAQUE(TypeName) \n"
 	"    Treat TypeName as equivalent to void, so pointers to it convert to and   \n"
 	"    from python integers. Useful for structs c-serpent cannot wrap. \n"
@@ -2458,7 +3281,11 @@ wrapopts_equal(WrapOpts a, WrapOpts b)
 		&& a.errstr == b.errstr
 		&& a.addresses == b.addresses
 		&& a.bytes == b.bytes
-		&& a.strip_underscore == b.strip_underscore;
+		&& a.strip_underscore == b.strip_underscore
+		&& a.invalidates == b.invalidates
+		&& a.fields_at == b.fields_at   && a.fields_n == b.fields_n
+		&& a.exclude_at == b.exclude_at && a.exclude_n == b.exclude_n
+		&& a.readonly_at == b.readonly_at && a.readonly_n == b.readonly_n;
 	#undef SAMESTR
 }
 
@@ -2471,6 +3298,7 @@ wrap_kind_name(int kind)
 		case WK_MANUAL:  return "CSERPENT_WRAPFN_MANUAL";
 		case WK_CONST:   return "CSERPENT_WRAPCONST";
 		case WK_OPAQUE:  return "CSERPENT_OPAQUE";
+		case WK_TYPE:    return "CSERPENT_WRAPTYPE";
 	}
 	return "?";
 }
@@ -2688,7 +3516,64 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 		Pass 2: emit.
 	*/
 
+	/*
+		2a. Parse every wrapped struct first. A function in one input may take
+		a struct wrapped from another, and the emitted type must exist before
+		any wrapper mentions it, so this cannot be folded into the loop below.
+	*/
+
+	for (int i = 0; i < ninputs; i++) {
+
+		args.filename = inputs[i];
+		args.opts = 0;
+
+		int ntok = lex_file(storage, args, 1<<27, tokens, storage->cached[i], 0x10000, string_store);
+		scan_annotations(storage, &args, ntok, tokens, i, 0, &module_loc);
+
+		clear_symbols(storage);
+		populate_symbols(storage, (ParseCtx){
+				.tokens_first = tokens, .tokens = tokens,
+				.tokens_end = tokens+ntok, .storage = storage, .args = args, });
+
+		for (int k = 0; k < storage->nitems; k++) {
+			if (storage->items[k].kind != WK_TYPE) continue;
+			if (storage->items[k].input != i) continue;
+
+			if (storage->nstructdefs == MAX_WRAPPED_TYPES)
+				die_at(args, storage->items[k].loc,
+					"too many wrapped types (max %i)", (int)MAX_WRAPPED_TYPES);
+
+			StructDef *d = &storage->structdefs[storage->nstructdefs];
+			ParseCtx p = { .tokens_first = tokens, .tokens = tokens,
+			               .tokens_end = tokens+ntok, .storage = storage, .args = args };
+
+			if (!parse_file_look_for_struct(p, storage->items[k].name, d))
+				die_at(args, storage->items[k].loc,
+					"no struct or union called '%s' in '%s'",
+					storage->items[k].name, inputs[i]);
+
+			storage->items[k].def = storage->nstructdefs++;
+		}
+	}
+
+	for (int k = 0; k < storage->nitems; k++)
+		if (storage->items[k].kind == WK_TYPE && storage->items[k].def < 0)
+			die_at(args, storage->items[k].loc,
+				"no struct or union called '%s' in any input", storage->items[k].name);
+
 	emit_preamble(args);
+
+	for (int k = 0; k < storage->nitems; k++)
+		if (storage->items[k].kind == WK_TYPE)
+			emit_struct_decl(args, storage->items[k].name,
+				storage->structdefs[storage->items[k].def].cspelling);
+
+	for (int k = 0; k < storage->nitems; k++)
+		if (storage->items[k].kind == WK_TYPE)
+			emit_struct_impl(args, storage, storage->items[k].name,
+				storage->structdefs[storage->items[k].def].cspelling,
+				&storage->structdefs[storage->items[k].def],
+				storage->items[k].opts, storage->items[k].loc);
 
 	for (int i = 0; i < ninputs; i++) {
 
@@ -2722,6 +3607,7 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 
 			WrapItem *it = &storage->items[k];
 			if (it->input != i) continue;
+			if (it->kind == WK_TYPE) continue;
 
 			args.opts = &it->opts;
 
@@ -2826,7 +3712,7 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 		}
 	}
 
-	emit_module(args, storage->nexports, storage->exports, num_enum_consts, enum_consts);
+	emit_module(args, storage, storage->nexports, storage->exports, num_enum_consts, enum_consts);
 
 	cleanup: // free memory
 	// read the storage pointer back out of the volatile record rather than
