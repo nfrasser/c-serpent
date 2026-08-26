@@ -513,6 +513,123 @@ CSERPENT_WRAPFN(f, wat = 1)
          src="void f(void);\n#ifdef CSERPENT\nCSERPENT_WRAPFN(f)\n#endif\n",
          err_lacks=["warning"]),
 
+    dict(name="errbuf_hidden_from_python",
+         src=PRELUDE + """
+void scale(int n, float *x, char *errmsg);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(scale, errbuf = errmsg)
+#endif
+""",
+         out_has=["char _cs_errbuf[80] = {0};",
+                  "if(_cs_errbuf[0]) {",
+                  "PyErr_SetString(PyExc_RuntimeError, _cs_errbuf)",
+                  'scale (n, (float *)x_data, _cs_errbuf);'],
+         # the buffer argument is supplied by the wrapper, so python never sees it
+         out_lacks=['(char*)"errmsg"']),
+
+    dict(name="errbuf_size_per_function_overrides_config",
+         src=PRELUDE + """
+void a_fn(char *errmsg);
+void b_fn(char *errmsg);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(a_fn, errbuf = errmsg)
+CSERPENT_WRAPFN(b_fn, errbuf = errmsg, errbuf_size = 256)
+#endif
+""",
+         out_has=["char _cs_errbuf[80] = {0};", "char _cs_errbuf[256] = {0};"]),
+
+    dict(name="err_errbuf_without_size",
+         src=PRELUDE + """
+void f(char *errmsg);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(f, errbuf = errmsg)
+#endif
+""",
+         rc=1, err_has=["errbuf needs a size"]),
+
+    dict(name="err_errbuf_unknown_argument",
+         src=PRELUDE + """
+void f(int n, char *msg);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(f, errbuf = errmsg)
+#endif
+""",
+         rc=1, err_has=["has no argument called 'errmsg'"]),
+
+    dict(name="err_errbuf_wrong_type",
+         src=PRELUDE + """
+void f(int errmsg);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(f, errbuf = errmsg)
+#endif
+""",
+         rc=1, err_has=["must be 'char *' to be used as an error buffer"]),
+
+    dict(name="errjmp_guards_the_call",
+         src=PRELUDE + """
+float risky(int n, float *x);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(runtime = 1, errjmp = 1)
+CSERPENT_WRAPFN(risky)
+#endif
+""",
+         out_has=["_Thread_local jmp_buf cserpent_error_jmp;",
+                  "void cserpent_raise(const char *msg)",
+                  "if (setjmp(cserpent_error_jmp) == 0) {",
+                  # the GIL save must be hand-rolled and volatile, or a longjmp
+                  # would skip the restore
+                  "PyThreadState * volatile _cs_save = NULL;",
+                  "if (_cs_save) PyEval_RestoreThread(_cs_save);",
+                  "PyErr_SetString(PyExc_RuntimeError, cserpent_error_msg);"],
+         out_lacks=["Py_BEGIN_ALLOW_THREADS"]),
+
+    dict(name="errjmp_runtime_off_by_default",
+         src=PRELUDE + """
+float risky(int n, float *x);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_CONFIG(errjmp = 1)
+CSERPENT_WRAPFN(risky)
+#endif
+""",
+         # declarations only: the definitions live in whichever module asked
+         # for runtime = 1, so two modules in one program do not collide
+         out_has=["extern _Thread_local jmp_buf cserpent_error_jmp;",
+                  "void cserpent_raise(const char *msg);"],
+         out_lacks=["_Thread_local int     cserpent_error_active = 0;"]),
+
+    dict(name="no_runtime_unless_asked",
+         src=PRELUDE + """
+float plain(int n, float *x);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(plain)
+#endif
+""",
+         out_has=["Py_BEGIN_ALLOW_THREADS"],
+         out_lacks=["cserpent_error_jmp", "setjmp"]),
+
+    dict(name="errjmp_per_function",
+         src=PRELUDE + """
+float a_fn(int n); float b_fn(int n);
+#ifdef CSERPENT
+CSERPENT_MODULE(m)
+CSERPENT_WRAPFN(a_fn, errjmp = 1)
+CSERPENT_WRAPFN(b_fn)
+#endif
+""",
+         out_has=["setjmp(cserpent_error_jmp)", "Py_BEGIN_ALLOW_THREADS"]),
+
     dict(name="array_writeable_required_unless_const",
          src=PRELUDE + """
 void  fill(int N, float *x);

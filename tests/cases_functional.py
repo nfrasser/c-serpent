@@ -230,6 +230,142 @@ except TypeError:
 """),
 
 
+    dict(name="functional_errbuf",
+         module="fn_err",
+         src=r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/*
+    The caller-supplied buffer idiom: NULL means report and die, non-NULL means
+    a buffer of at least 80 bytes which is zeroed on entry.
+*/
+void scale(int n, float *x, float k, char *errmsg)
+{
+    if (errmsg) errmsg[0] = 0;
+    if (n < 0) {
+        if (!errmsg) { fprintf(stderr, "negative length\n"); exit(EXIT_FAILURE); }
+        snprintf(errmsg, 80, "negative length: %d", n);
+        return;
+    }
+    for (int i = 0; i < n; i++) x[i] *= k;
+}
+
+#ifdef CSERPENT
+CSERPENT_MODULE(fn_err)
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(scale, errbuf = errmsg)
+#endif
+""",
+         test=r"""
+import numpy, fn_err as m
+
+x = numpy.array([1, 2, 3], dtype=numpy.float32)
+m.scale(3, x, 2.0)
+assert x.tolist() == [2.0, 4.0, 6.0]
+
+# an error written into the buffer becomes an exception carrying the message
+try:
+    m.scale(-1, x, 2.0)
+    raise AssertionError("expected RuntimeError")
+except RuntimeError as e:
+    assert str(e) == "negative length: -1", e
+
+# the buffer argument is supplied by the wrapper: python cannot pass it, and
+# the function is therefore never called with errmsg == NULL, so its
+# exit(EXIT_FAILURE) path is unreachable from python
+try:
+    m.scale(3, x, 2.0, "oops")
+    raise AssertionError("expected TypeError")
+except TypeError:
+    pass
+"""),
+
+    dict(name="functional_errjmp",
+         module="fn_jmp",
+         src=r"""
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+/*
+    A library with an overridable assert and no return path for error data:
+    the handler is not expected to return, so the only alternatives are abort
+    (which takes the interpreter with it) and longjmp.
+*/
+static void (*lib_panic)(const char *msg, const char *file, int line);
+void lib_set_panic(void (*fn)(const char*, const char*, int)) { lib_panic = fn; }
+
+#define LIB_ASSERT(c) do { if(!(c)) { \
+    if (lib_panic) lib_panic(#c, __FILE__, __LINE__); \
+    fprintf(stderr, "assert failed: %s\n", #c); abort(); } } while(0)
+
+float lib_mean(int n, float *x)
+{
+    LIB_ASSERT(n > 0);
+    LIB_ASSERT(x != 0);
+    float s = 0;
+    for (int i = 0; i < n; i++) s += x[i];
+    return s / n;
+}
+
+/* the adapter the user writes: c-serpent cannot know the library's hook API */
+void cserpent_raise(const char *msg);
+
+static void my_panic(const char *msg, const char *file, int line)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "assertion failed: %s (%s:%d)", msg, file, line);
+    cserpent_raise(buf);
+}
+
+void install(void) { lib_set_panic(my_panic); }
+
+#ifdef CSERPENT
+CSERPENT_MODULE(fn_jmp)
+CSERPENT_CONFIG(runtime = 1, errjmp = 1)
+CSERPENT_WRAPFN(lib_mean, install)
+#endif
+""",
+         test=r"""
+import numpy, threading, fn_jmp as m
+
+m.install()
+x = numpy.array([1, 2, 3], dtype=numpy.float32)
+
+assert m.lib_mean(3, x) == 2.0
+
+# a failed assertion arrives as an exception rather than killing the process
+for bad, want in ((-1, "n > 0"), (None, "x != 0")):
+    try:
+        m.lib_mean(3 if bad is None else bad, None if bad is None else x)
+        raise AssertionError("expected RuntimeError")
+    except RuntimeError as e:
+        assert want in str(e), e
+        assert "assertion failed" in str(e), e
+
+# and the interpreter is still here afterwards
+assert m.lib_mean(3, x) == 2.0
+
+# the jmp_buf is thread-local, so concurrent failures do not tread on each
+# other -- and crucially the GIL is reacquired on the longjmp path, which is
+# what stops this from deadlocking or crashing
+errs = []
+def worker():
+    try:
+        m.lib_mean(-5, x)
+    except RuntimeError as e:
+        errs.append(str(e))
+
+ts = [threading.Thread(target=worker) for _ in range(4)]
+for t in ts: t.start()
+for t in ts: t.join()
+assert len(errs) == 4, errs
+assert len(set(errs)) == 1, errs
+
+assert m.lib_mean(3, x) == 2.0
+"""),
     dict(name="functional_converter",
          module="fn_view",
          # the converters mention PyObject and numpy, so c-serpent's own

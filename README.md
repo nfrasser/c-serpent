@@ -266,21 +266,19 @@ Annotations
             name = "str"      the name Python sees, if different from the C
                               name. Only valid with a single name.
             doc = "str"       docstring
-            errstr = 1        the function returns `const char *`, and a
-                              non-NULL return is an error message: raise it
-            errcheck = fn     after calling, call `fn`, which must return
-                              `const char *`; non-NULL becomes an exception
-            errarg = N        which argument to hand to `errcheck`. 0, the
-                              default, means the wrapped function's return value
             addresses = 0|1   accept python integers, representing raw
                               addresses, where numpy arrays are expected
             bytes = 0|1       accept bytes objects where numpy arrays are
                               expected
+            invalidates = N   the call frees its N-th argument (1-based); mark
+                              that wrapped struct dead afterwards
+
+        Plus the error-handling options `errstr`, `errcheck`, `errarg`,
+        `errbuf` and `errbuf_size`, which have their own section below.
 
         For example:
 
             CSERPENT_WRAPFN(alpha, beta, gamma)
-            CSERPENT_WRAPFN(read_frame, errcheck = check_err, errarg = 2)
             CSERPENT_WRAPFN(fft_internal, name = "fft", doc = "In-place FFT.")
 
     CSERPENT_WRAPFN_GENERIC(prefix, options...)
@@ -447,6 +445,126 @@ CSERPENT_CONVERTER(from_python = view2d_from_obj)
                                 manifest already includes the real headers.
             float16 = 0|1       enable `_Float16` support (requires compiler
                                 support)
+
+Error handling
+--------------
+
+C code reports errors in several different ways, and C-serpent knows about the
+common ones. In every case the result is the same from Python: a
+`RuntimeError` carrying the message. Pick whichever matches your code.
+
+Wherever these say "string", either `char *` or `const char *` will do.
+
+**The function returns an error string.** A non-NULL return is the message:
+
+```c
+const char *do_thing(int x);      /* plain 'char *' works too */
+
+CSERPENT_WRAPFN(do_thing, errstr = 1)
+```
+
+**A separate function reports the error.** C-serpent calls `errcheck` after the
+wrapped function; if it returns a non-NULL string, that becomes the exception.
+`errarg` picks which argument to hand it — `0`, the default, means the wrapped
+function's return value:
+
+```c
+int         read_frame(ctx *c, int n, buffer *b);
+const char *check_err(buffer *b);
+
+CSERPENT_WRAPFN(read_frame, errcheck = check_err, errarg = 3)
+```
+
+**The caller supplies an error buffer.** A common C idiom: the function takes a
+`char *errmsg` which is NULL for "print to stderr and exit", or points at a
+caller-provided buffer of some documented length, zeroed on entry, into which a
+message is written on failure.
+
+```c
+void scale(int n, float *x, float k, char *errmsg);
+
+CSERPENT_CONFIG(errbuf_size = 80)
+CSERPENT_WRAPFN(scale, errbuf = errmsg)
+```
+
+C-serpent declares the buffer, passes it, and raises if its first byte is
+non-zero. **The named argument disappears from the Python signature** — it is
+supplied by the wrapper, not by the caller:
+
+```
+>>> scale(3, x, 2.0)          # no errmsg argument
+>>> scale(-1, x, 2.0)
+RuntimeError: negative length: -1
+```
+
+Because a buffer is always passed, the `errmsg == NULL` branch is unreachable
+from Python. That matters: `exit(EXIT_FAILURE)` inside an extension module
+takes the interpreter down with no traceback.
+
+`errbuf_size` has no default and must be set, either per function or for a
+whole file with `CSERPENT_CONFIG(errbuf_size = N)` as above. It must be at
+least the length your function documents — a buffer that is too small is a
+stack overflow, which is not a thing to guess at.
+
+The `char **errmsg` variant, where the function points you at a static string,
+is not yet supported: C-serpent's type representation does not currently carry
+pointer-to-pointer types.
+
+**The library asserts, and has no error return path at all.** Some libraries
+let you override an assert or panic handler but give you nowhere to put an
+error: the handler is simply not expected to return. In C you let it `abort()`.
+From Python — especially in a notebook — you would much rather have a traceback
+than lose the interpreter and everything in it.
+
+`errjmp` guards the call with `setjmp`, so a `longjmp` out of your handler
+becomes an exception:
+
+```c
+CSERPENT_CONFIG(runtime = 1, errjmp = 1)
+CSERPENT_WRAPFN(lib_mean)
+```
+
+`runtime = 1` emits a small runtime into the generated file:
+
+```c
+void cserpent_raise(const char *msg);
+```
+
+which you call from your handler. C-serpent cannot know your library's
+registration API, so that adapter is yours to write:
+
+```c
+static void my_panic(const char *msg, const char *file, int line)
+{
+    char buf[256];
+    snprintf(buf, sizeof buf, "assertion failed: %s (%s:%d)", msg, file, line);
+    cserpent_raise(buf);
+}
+lib_set_panic(my_panic);
+```
+
+```
+>>> lib_mean(-1, x)
+RuntimeError: assertion failed: n > 0 (mylib.c:15)
+```
+
+Called outside a wrapped function, `cserpent_raise` keeps the original
+behaviour — print and abort — so linking it in does not change how your program
+behaves when Python is not involved. The state it uses is thread-local, and a
+guarded wrapper saves and restores the previous jump target, so nesting and
+threads both work.
+
+**`runtime = 1` is off by default and should appear in exactly one module.**
+The runtime defines external symbols; if two C-serpent modules are linked into
+one program and both define them, they collide. Every other module that uses
+`errjmp` emits declarations only and links against the one that has it.
+
+Two things to be honest about. `longjmp` abandons whatever the library had
+allocated or locked at the point of the assertion, so that memory leaks and, if
+it held a lock, the library may be unusable afterwards. And catching a failed
+assertion gets you a traceback pointing at the offending Python line, which is
+the actual goal — it does not promise the library is in a fit state to keep
+using. For a programmer error that is the right trade, but it is a trade.
 
 Command line
 ------------

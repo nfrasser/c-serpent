@@ -138,6 +138,10 @@ typedef struct {
 	/* CSERPENT_CONVERTER: user-written marshalling functions */
 	const char *from_python;
 	const char *to_python;
+	/* CSERPENT_WRAPFN errbuf: name of a caller-supplied error buffer argument */
+	const char *errbuf;
+	int         errbuf_size;
+	signed char errjmp;        /* catch a longjmp out of the call */
 	/*
 		CSERPENT_WRAPTYPE lists, as (start, count) into the shared name pool.
 		readonly_n == -1 means every member is read-only.
@@ -175,6 +179,12 @@ typedef struct {
 	Loc         loc;
 } ConfigVal;
 
+/* like ConfigVal, but for settings that are not 0/1 */
+typedef struct {
+	int value;
+	Loc loc;
+} ConfigInt;
+
 typedef struct
 {
 	int verbose;
@@ -187,6 +197,9 @@ typedef struct
 	ConfigVal cfg_bytes;
 	ConfigVal cfg_declarations;
 	ConfigVal cfg_float16;
+	ConfigInt cfg_errbuf_size;
+	ConfigVal cfg_errjmp;
+	ConfigVal cfg_runtime;
 
 	/* the item currently being emitted, if any */
 	const WrapOpts *opts;
@@ -986,6 +999,118 @@ emit_preamble(CSerpentArgs args)
 		f16_c);	
 }
 
+/*
+	Emitted once per output when any function uses errjmp. The definitions are
+	only emitted when asked for with CSERPENT_CONFIG(runtime = 1), because
+	these are external symbols: two c-serpent modules linked into one program
+	must not each define them.
+*/
+static void
+emit_error_runtime(CSerpentArgs args, int define_it)
+{
+	fprintf(args.ostream,
+	"#include <setjmp.h> \n"
+	"#include <stdio.h> \n"
+	"#include <stdlib.h> \n"
+	"\n"
+	"#ifndef CSERPENT_ERROR_MSG_SIZE \n"
+	"#define CSERPENT_ERROR_MSG_SIZE 256 \n"
+	"#endif \n"
+	"\n");
+
+	if (!define_it) {
+		fprintf(args.ostream,
+		"/* runtime defined elsewhere; see CSERPENT_CONFIG(runtime = 1) */ \n"
+		"extern _Thread_local jmp_buf cserpent_error_jmp; \n"
+		"extern _Thread_local char    cserpent_error_msg[CSERPENT_ERROR_MSG_SIZE]; \n"
+		"extern _Thread_local int     cserpent_error_active; \n"
+		"void cserpent_raise(const char *msg); \n"
+		"\n");
+		return;
+	}
+
+	fprintf(args.ostream,
+	"_Thread_local jmp_buf cserpent_error_jmp; \n"
+	"_Thread_local char    cserpent_error_msg[CSERPENT_ERROR_MSG_SIZE]; \n"
+	"_Thread_local int     cserpent_error_active = 0; \n"
+	"\n"
+	"/* \n"
+	"    Call this from your library's assert or panic handler. Inside a wrapped \n"
+	"    call it unwinds back to the wrapper, which raises a python exception. \n"
+	"    Outside one it keeps the original behaviour, so linking this in does \n"
+	"    not change how your program behaves when python is not involved. \n"
+	"*/ \n"
+	"void cserpent_raise(const char *msg) \n"
+	"{ \n"
+	"    snprintf(cserpent_error_msg, sizeof cserpent_error_msg, \"%%s\", \n"
+	"             msg ? msg : \"(no message)\"); \n"
+	"    if (cserpent_error_active) longjmp(cserpent_error_jmp, 1); \n"
+	"    fputs(cserpent_error_msg, stderr); \n"
+	"    fputc('\\n', stderr); \n"
+	"    abort(); \n"
+	"} \n"
+	"\n");
+}
+
+static int
+wrapper_uses_errjmp(CSerpentArgs args)
+{
+	signed char item = args.opts ? args.opts->errjmp : -1;
+	return opt_or_cfg(item, args.cfg_errjmp, 0);
+}
+
+/*
+	Open and close the region around the call to the wrapped function.
+
+	Without errjmp this is just the usual GIL release. With it, the call is
+	guarded by setjmp -- which rules out Py_BEGIN_ALLOW_THREADS, because its
+	PyThreadState is scoped inside the macro and a longjmp would skip the
+	matching restore, leaving us without the GIL at the point where we want to
+	raise. So the save/restore is hand-rolled, and volatile, since a local
+	modified between setjmp and longjmp is otherwise indeterminate.
+*/
+static void
+emit_call_begin(CSerpentArgs args)
+{
+	if (!wrapper_uses_errjmp(args)) {
+		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		return;
+	}
+
+	fprintf(args.ostream,
+	"    PyThreadState * volatile _cs_save = NULL; \n"
+	"    volatile int _cs_jumped = 0; \n"
+	"    jmp_buf _cs_prev_jmp; \n"
+	"    volatile int _cs_prev_active = cserpent_error_active; \n"
+	"    memcpy(_cs_prev_jmp, cserpent_error_jmp, sizeof(_cs_prev_jmp)); \n"
+	"    if (setjmp(cserpent_error_jmp) == 0) { \n"
+	"        cserpent_error_active = 1; \n"
+	"        _cs_save = PyEval_SaveThread(); \n");
+}
+
+static void
+emit_call_end(CSerpentArgs args)
+{
+	if (!wrapper_uses_errjmp(args)) {
+		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		return;
+	}
+
+	fprintf(args.ostream,
+	"        PyEval_RestoreThread(_cs_save); \n"
+	"        _cs_save = NULL; \n"
+	"    } else { \n"
+	"        _cs_jumped = 1; \n"
+	"        if (_cs_save) PyEval_RestoreThread(_cs_save); \n"
+	"    } \n"
+	"    cserpent_error_active = _cs_prev_active; \n"
+	"    memcpy(cserpent_error_jmp, _cs_prev_jmp, sizeof(_cs_prev_jmp)); \n"
+	"    if (_cs_jumped) { \n"
+	"        PyErr_SetString(PyExc_RuntimeError, cserpent_error_msg); \n"
+	"        return 0; \n"
+	"    } \n");
+}
+
 static int 
 is_string(Type t)
 {
@@ -1126,6 +1251,21 @@ member_readonly(StorageBuffers *st, WrapOpts o, const char *m)
 }
 
 /*
+	Index of the argument named by 'errbuf = ', or -1. That argument is
+	supplied by the wrapper rather than by Python: it never appears in the
+	keyword list or the format string.
+*/
+static int
+errbuf_arg_index(CSerpentArgs args, int n_fnargs, Symbol fnargs[])
+{
+	const WrapOpts *o = args.opts;
+	if (!o || !o->errbuf) return -1;
+	for (int i = 0; i < n_fnargs; i++)
+		if (!strcmp(fnargs[i].name, o->errbuf)) return i;
+	return -1;
+}
+
+/*
 	'invalidates = N' marks the N-th argument (1-based) dead after the call,
 	so that using a struct whose memory C has just freed raises rather than
 	reading freed memory.
@@ -1151,6 +1291,19 @@ emit_exceptionhandling(const char *fn, CSerpentArgs args, int n_fnargs, Symbol f
 {
 	const WrapOpts *o = args.opts;
 	if(!o) return;
+
+	/*
+		The caller-supplied buffer idiom: c-serpent passes a zeroed buffer, so
+		a non-empty first byte means the function reported an error. Passing a
+		buffer at all is what keeps the function off its errmsg==NULL path,
+		which would print to stderr and exit -- taking the interpreter with it.
+	*/
+	if(o->errbuf && errbuf_arg_index(args, n_fnargs, fnargs) >= 0) {
+		fprintf(args.ostream, "    if(_cs_errbuf[0]) {  \n");
+		fprintf(args.ostream, "        PyErr_SetString(PyExc_RuntimeError, _cs_errbuf);  \n");
+		fprintf(args.ostream, "        return 0;  \n");
+		fprintf(args.ostream, "    }  \n");
+	}
 
 	if(o->errcheck) {
 
@@ -1184,11 +1337,15 @@ emit_call(const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnargs, S
 {
 	fprintf(args.ostream, "%s (", fn);
 
+	int errbuf_i = errbuf_arg_index(args, n_fnargs, fnargs);
+
 	for(int i = 0; i < n_fnargs; i++)
 	{
 		char *sep  =  i ? ", " : "";
 		int mk = classify_member(st, fnargs[i].type);
-		if (converter_for(st, fnargs[i].type)) {
+		if (i == errbuf_i) {
+			fprintf(args.ostream, "%s_cs_errbuf", sep);
+		} else if (converter_for(st, fnargs[i].type)) {
 			fprintf(args.ostream, "%s%s", sep, fnargs[i].name);
 		} else if (mk == MK_STRUCTPTR || mk == MK_STRUCTVAL) {
 			/* already unpacked into a local of the right type */
@@ -1236,6 +1393,35 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 	int use_bytes     = opt_or_cfg(o_bytes,     args.cfg_bytes,     0);
 	int emit_decls    = args.cfg_declarations.value < 0 ? 1 : args.cfg_declarations.value;
 
+	int errbuf_i  = errbuf_arg_index(args, n_fnargs, fnargs);
+	int errbuf_sz = 0;
+
+	if (args.opts && args.opts->errbuf) {
+		if (errbuf_i < 0)
+			die2(args, "Error wrapping function '%s' in file '%s': errbuf = %s, "
+			     "but the function has no argument called '%s'",
+			     fn, args.filename, args.opts->errbuf, args.opts->errbuf);
+
+		if (!is_string(fnargs[errbuf_i].type))
+			die2(args, "Error wrapping function '%s' in file '%s': argument '%s' "
+			     "must be 'char *' to be used as an error buffer",
+			     fn, args.filename, args.opts->errbuf);
+
+		errbuf_sz = args.opts->errbuf_size > 0
+		          ? args.opts->errbuf_size
+		          : (args.cfg_errbuf_size.value > 0 ? args.cfg_errbuf_size.value : 0);
+
+		/*
+			No default: a buffer smaller than the one the function documents
+			is a stack overflow, and that is not a number to guess at.
+		*/
+		if (errbuf_sz <= 0)
+			die2(args, "Error wrapping function '%s' in file '%s': errbuf needs a size. "
+			     "Set errbuf_size on the wrap, or CSERPENT_CONFIG(errbuf_size = N) "
+			     "for the whole file. It must be at least the length the function documents",
+			     fn, args.filename);
+	}
+
 	// declaration for function to be wrapped; never for a static one, whose
 	// definition must already be in this translation unit
 	if(emit_decls && !is_static) {
@@ -1266,14 +1452,20 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 
 	if(n_fnargs) {
 
+		if (errbuf_i >= 0)
+			fprintf(args.ostream, "    char _cs_errbuf[%i] = {0};\n", errbuf_sz);
+
 		// keyword name list
 		fprintf(args.ostream, "    static char *kwlist[] = {");
-	        for(int i = 0; i < n_fnargs; i++)
+	        for(int i = 0; i < n_fnargs; i++) {
+			if (i == errbuf_i) continue;   /* supplied by the wrapper */
 			fprintf(args.ostream, "\n        (char*)\"%s\",", fnargs[i].name);
+		}
 		fprintf(args.ostream, "0};\n");
 
 		// declare a C variable for each argument
 		for(int i = 0; i < n_fnargs; i++) {
+			if (i == errbuf_i) continue;
 			Symbol arg = fnargs[i];
 
 			int mk = classify_member(st, arg.type);
@@ -1325,6 +1517,7 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		fprintf(args.ostream, "\n    if(!PyArg_ParseTupleAndKeywords(args, kwds, \"");
 		for (int i = 0; i < n_fnargs; i++) {
 			// building the format string for ParseTupleAndKeywords
+			if (i == errbuf_i) continue;
 			Symbol arg = fnargs[i];
 
 			int mk = classify_member(st, arg.type);
@@ -1351,6 +1544,7 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		fprintf(args.ostream, "\", kwlist");
 		for (int i = 0; i < n_fnargs; i++) {
 			// emit addresses for the arguments we actually want
+			if (i == errbuf_i) continue;
 			fprintf(args.ostream, ",\n        ");
 			Symbol arg = fnargs[i];
 
@@ -1371,6 +1565,7 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		// type checking for any numpy arrays, conversions for any void pointers
 		for (int i = 0; i < n_fnargs; i++)
 		{
+			if (i == errbuf_i) continue;
 			Symbol arg = fnargs[i];
 
 			int mk = classify_member(st, arg.type);
@@ -1480,10 +1675,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 
 	if (is_plainvoid(rtntype)) {
 
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    Py_RETURN_NONE;\n");
@@ -1494,10 +1689,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		assert(ssizeof(buf) > repr_type(sizeof(buf), buf, rtntype));
 
 		fprintf(args.ostream, "    %s rtn = 0;\n", buf);
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    rtn = ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return Py_BuildValue(\"s\", rtn);\n");
@@ -1508,10 +1703,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		assert(ssizeof(buf) > repr_type(sizeof(buf), buf, rtntype));
 
 		fprintf(args.ostream, "    %s rtn = 0;\n", buf);
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    rtn = ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return PyLong_FromVoidPtr(rtn);\n");
@@ -1528,10 +1723,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 			     fn, args.filename, buf);
 
 		fprintf(args.ostream, "    %s rtn;\n", buf);
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    rtn = ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		fprintf(args.ostream, "    return %s(rtn);\n", conv->to_python);
@@ -1544,10 +1739,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		repr_type(sizeof(buf), buf, byval ? rtntype : basetype(rtntype));
 
 		fprintf(args.ostream, "    %s%s rtn;\n", buf, byval ? "" : " *");
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    rtn = ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 
@@ -1582,10 +1777,10 @@ emit_wrapper (const char *fn, CSerpentArgs args, StorageBuffers *st, int n_fnarg
 		else
 			fprintf(args.ostream, "    %s rtn = 0;\n", buf);
 
-		fprintf(args.ostream, "    Py_BEGIN_ALLOW_THREADS;\n");
+		emit_call_begin(args);
 		fprintf(args.ostream, "    rtn = ");
 		emit_call(fn, args, st, n_fnargs, fnargs);
-		fprintf(args.ostream, "    Py_END_ALLOW_THREADS;\n");
+		emit_call_end(args);
 		emit_invalidations(args, n_fnargs, fnargs);
 		emit_exceptionhandling(fn, args, n_fnargs, fnargs);
 		if (rtntype.category == T_BOOL) {
@@ -2987,11 +3182,27 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 			if (!a[k].key)
 				die_at(*args, loc, "CSERPENT_CONFIG takes only 'key = value' options");
 			const char *key = a[k].key;
+
+			if (!strcmp(key, "errbuf_size")) {
+				int n = ann_int(*args, loc, macro, key, a[k].val);
+				if (n <= 0) die_at(*args, loc, "CSERPENT_CONFIG: 'errbuf_size' must be positive");
+				if (args->cfg_errbuf_size.value > 0 && args->cfg_errbuf_size.value != n)
+					die_at(*args, loc,
+						"CSERPENT_CONFIG: 'errbuf_size' set to %i here, but to %i at %s:%i",
+						n, args->cfg_errbuf_size.value,
+						args->cfg_errbuf_size.loc.file, args->cfg_errbuf_size.loc.line);
+				args->cfg_errbuf_size.value = n;
+				args->cfg_errbuf_size.loc = loc;
+				continue;
+			}
+
 			int v = ann_bool(*args, loc, macro, key, a[k].val);
 			if      (!strcmp(key, "addresses"))    set_config(args, &args->cfg_addresses,    key, v, loc, 0);
 			else if (!strcmp(key, "bytes"))        set_config(args, &args->cfg_bytes,        key, v, loc, 0);
 			else if (!strcmp(key, "declarations")) set_config(args, &args->cfg_declarations, key, v, loc, 0);
 			else if (!strcmp(key, "float16"))      set_config(args, &args->cfg_float16,      key, v, loc, 1);
+			else if (!strcmp(key, "errjmp"))       set_config(args, &args->cfg_errjmp,       key, v, loc, 0);
+			else if (!strcmp(key, "runtime"))      set_config(args, &args->cfg_runtime,      key, v, loc, 0);
 			else die_at(*args, loc, "CSERPENT_CONFIG: unknown key '%s'", key);
 		}
 		return;
@@ -3000,7 +3211,7 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 	/* the remaining forms all take names, and all but WRAPCONST take options */
 
 	WrapOpts o = {
-		.errarg = 0, .errstr = -1,
+		.errarg = 0, .errstr = -1, .errjmp = -1,
 		.addresses = -1, .bytes = -1, .strip_underscore = -1,
 	};
 	const char *names[MAX_ANN_ARGS];
@@ -3055,6 +3266,13 @@ handle_annotation(StorageBuffers *st, CSerpentArgs *args, const char *macro, Loc
 			o.errarg = ann_int(*args, loc, macro, key, a[k].val);
 			saw_errarg = 1;
 			if (o.errarg < 0) die_at(*args, loc, "%s: errarg must not be negative", macro);
+		}
+		else if (!strcmp(key, "errbuf")) o.errbuf = ann_ident(*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "errjmp")) o.errjmp = ann_bool(*args, loc, macro, key, a[k].val);
+		else if (!strcmp(key, "errbuf_size")) {
+			o.errbuf_size = ann_int(*args, loc, macro, key, a[k].val);
+			if (o.errbuf_size <= 0)
+				die_at(*args, loc, "%s: 'errbuf_size' must be positive", macro);
 		}
 		else if (!strcmp(key, "invalidates")) {
 			o.invalidates = ann_int(*args, loc, macro, key, a[k].val);
@@ -3432,9 +3650,21 @@ usage(void)
 	"    Wrap one or more functions. Options apply to all names given: \n"
 	"      name = \"str\"     name seen from Python, if different (one name only)  \n"
 	"      doc = \"str\"      docstring \n"
-	"      errstr = 1       a non-NULL 'const char *' return is an error message \n"
-	"      errcheck = fn    call fn afterwards; non-NULL 'const char *' -> raise  \n"
+	"      errstr = 1       a non-NULL string return is an error message        \n"
+	"      errcheck = fn    call fn afterwards; a non-NULL string return raises  \n"
 	"      errarg = N       argument handed to errcheck; 0 means the return value \n"
+	"      errbuf = name    the named 'char *' argument is a caller-supplied     \n"
+	"                       error buffer: c-serpent declares and passes it, and  \n"
+	"                       raises if it is non-empty afterwards. That argument  \n"
+	"                       disappears from the python signature. \n"
+	"      errbuf_size = N  size of that buffer. Required, either here or with   \n"
+	"                       CSERPENT_CONFIG(errbuf_size = N); it must be at      \n"
+	"                       least the length the function documents. \n"
+	"      errjmp = 0|1     guard the call with setjmp, so that a longjmp out of \n"
+	"                       your assert/panic handler becomes an exception       \n"
+	"                       instead of an abort. Needs the runtime; see          \n"
+	"                       CSERPENT_CONFIG(runtime = 1). \n"
+	"      invalidates = N  the call frees its N-th argument (1-based) \n"
 	"      addresses = 0|1  accept python ints as raw addresses where arrays go   \n"
 	"      bytes = 0|1      accept bytes objects where arrays go \n"
 	"                                                                             \n"
@@ -3508,6 +3738,12 @@ usage(void)
 	"      bytes = 0|1         default for the per-function option \n"
 	"      declarations = 0|1  emit declarations for wrapped functions (default 1)\n"
 	"      float16 = 0|1       enable _Float16 support (needs compiler support)   \n"
+	"      errbuf_size = N     default size for errbuf buffers \n"
+	"      errjmp = 0|1        default for the per-function option \n"
+	"      runtime = 0|1       emit the c-serpent runtime, which provides        \n"
+	"                          cserpent_raise() for use from your assert or      \n"
+	"                          panic handler. Off by default; it defines external\n"
+	"                          symbols, so exactly one module should emit it.    \n"
 	"                                                                             \n"
 	"Environment variables: \n"
 	"                                                                             \n"
@@ -3559,7 +3795,11 @@ wrapopts_equal(WrapOpts a, WrapOpts b)
 		&& ((a.from_python == b.from_python)
 			|| (a.from_python && b.from_python && !strcmp(a.from_python, b.from_python)))
 		&& ((a.to_python == b.to_python)
-			|| (a.to_python && b.to_python && !strcmp(a.to_python, b.to_python)));
+			|| (a.to_python && b.to_python && !strcmp(a.to_python, b.to_python)))
+		&& a.errbuf_size == b.errbuf_size
+		&& a.errjmp == b.errjmp
+		&& ((a.errbuf == b.errbuf)
+			|| (a.errbuf && b.errbuf && !strcmp(a.errbuf, b.errbuf)));
 	#undef SAMESTR
 }
 
@@ -3627,6 +3867,9 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 			.cfg_bytes        = {.value = -1},
 			.cfg_declarations = {.value = -1},
 			.cfg_float16      = {.value = -1},
+			.cfg_errbuf_size  = {.value = -1},
+			.cfg_errjmp       = {.value = -1},
+			.cfg_runtime      = {.value = -1},
 		};
 
 	if(!(text && string_store && tokens && storage))
@@ -3938,6 +4181,17 @@ cserpent_main (char *argv[], FILE *in_stream, FILE *out_stream, FILE *err_stream
 				"no struct or union called '%s' in any input", storage->items[k].name);
 
 	emit_preamble(args);
+
+	{
+		int any_errjmp = args.cfg_errjmp.value > 0;
+		for (int k = 0; k < storage->nitems && !any_errjmp; k++)
+			if (storage->items[k].opts.errjmp > 0) any_errjmp = 1;
+
+		if (args.cfg_runtime.value > 0)
+			emit_error_runtime(args, 1);
+		else if (any_errjmp)
+			emit_error_runtime(args, 0);
+	}
 
 	for (int k = 0; k < storage->nitems; k++)
 		if (storage->items[k].kind == WK_TYPE)
