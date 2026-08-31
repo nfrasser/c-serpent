@@ -27,10 +27,12 @@ There are two ways to use C-serpent:
 - **For interactive development in Jupyter.** If you use Jupyter for
   interactive development, you can just write C code in a string within
   your notebook and use the machinery in cserpent.py to compile and
-  run it on the fly. Live code re-loading is supported. The annotations are
-  identical to the ones used here, so notebook code ports into a `.c` file by
-  copy and paste; the only addition is a `CSERPENT_MODULE` line, which the
-  notebook supplies for you. A `%%cserpent` cell magic is also registered.
+  run it on the fly. Live code re-loading is supported. The annotations 
+  required in this mode are identical to the ones used in this README 
+  (so notebook code ports into a `.c` file by copy and paste when you're
+  ready for deployment), with the exception that the notebook supplies the
+  otherwise needed `CSERPENT_MODULE` line for you. 
+  A `%%cserpent` cell magic is also registered.
   cserpent.py assumes the compiler is gcc, but it should work with
   clang as well if you override some default options. See cserpent.py
   for details. MSVC is not currently supported.
@@ -80,12 +82,7 @@ types, but other pointer types are not (so define your output arrays in
 Python, and populate them with C code). Non-void pointer arguments also 
 accept `None`, which results in a null pointer being passed to the C function.
 `stdint.h` types are supported, since they are just typedefs.
-
-Array arguments must be C-contiguous and suitably aligned. They must also be
-writeable, unless the parameter is `const`-qualified — C-serpent cannot tell
-which arguments a function writes to, so it goes by the pointer type. Declaring
-a read-only parameter as `const T *` is what lets a caller pass a read-only
-numpy array to it.
+Numpy array arguments must be C-contiguous and suitably aligned. 
 
 Example, consider this C function:
 
@@ -117,8 +114,8 @@ If you only want the command line program, you do not need pip at all:
     $ sudo make install     # copies it to /usr/local/bin
 
 And if you would rather vendor it, `cserpent.c` and `stb_c_lexer.h` are a
-self-contained pair — drop them in your tree and compile `cserpent.c`. That is
-a supported way to use it, not a workaround.
+self-contained pair — drop them in your tree and compile `cserpent.c`. This is
+a fully valid and supported way to use it.
 
 Compiling
 ---------
@@ -131,34 +128,12 @@ For example on a unix-derivative,
 You can define `CSERPENT_DISABLE_ASSERT` to compile out assertions, if
 you wish to.
         
-Tests
------
-
-    $ python3 tests/run_tests.py
-
-There are three kinds. *Codegen* tests run C-serpent over a snippet and check
-what it emitted, or which error it produced; they need only a C compiler.
-*Functional* tests compile the generated wrapper into a real extension module,
-import it, and assert on actual behaviour. *Notebook* tests exercise
-`cserpent.py`. The last two additionally need Python and numpy headers.
-
-If the Python running the tests lacks those headers, the functional tests are
-skipped with a message rather than failing. Point at one that has them with:
-
-    $ python3 tests/run_tests.py --python /path/to/venv/bin/python
-
-`-k PATTERN` runs a subset, `--keep` retains the temporary build directory, and
-`-v` lists each test as it passes. New cases are added as dicts in
-`tests/cases_codegen.py`, `tests/cases_functional.py` and
-`tests/cases_notebook.py`.
-
 Usage
 -----
 
 You tell C-serpent what to wrap *in the C source itself*, inside `#ifdef CSERPENT`
 blocks. C-serpent defines `CSERPENT` when it preprocesses your file; nothing else
-does, so those blocks vanish from every ordinary build. They are plain C syntax,
-so editors and language servers do not complain about them.
+does, so those blocks vanish from every ordinary build. 
 
 C-serpent generates code, so you'll have to compile that code into an extension
 module in order to actually import and use the module.
@@ -174,7 +149,7 @@ Consider the same example function from above:
 
 To make this function callable from Python, you might do the following:
 
-1. save that function to a file (e.g. `mean.c`), and annotate it:
+1. save that function to a file (e.g. `mean.c`), and add the necessary annotations somewhere in the file:
 
 ```c
 #ifdef CSERPENT
@@ -201,6 +176,9 @@ $ python
 $ cserpent mean.c > mean_wrappers.c
 ```
 
+Several input files may be given at once, you don't necessarily need a separate `cserpent` invocation
+per file.
+
 4. compile the wrapper code and the original C code into an extension module
 
 ```
@@ -224,9 +202,9 @@ $ python
 Manifest files
 --------------
 
-Annotations do not have to live next to the code they describe. Because they
-work in headers too, the usual arrangement is a *manifest*: a file that includes
-the headers it needs and otherwise contains nothing but instructions.
+Annotations do not have to be in the same file as the code they describe; they
+work in headers too. You can therefore, if you prefer, use a *manifest*: a file that includes
+the headers it needs and otherwise contains nothing but c-serpent instructions.
 
 ```c
 /* mymodule.cs.c */
@@ -244,28 +222,28 @@ CSERPENT_WRAPFN_GENERIC(sum_)
 $ cserpent mymodule.cs.c > wrappers.c
 ```
 
-This is the recommended style. It works on code you cannot edit — vendored
+This works on code you cannot (or do not wish to) edit — vendored
 libraries, system headers, generated sources — and it keeps module names out of
-library sources, where they do not belong. Several inputs may be given at once:
-`cserpent mymodule.cs.c extra.c`.
+library sources, where they do not belong. 
 
 Annotations
 -----------
 
     CSERPENT_MODULE(name)
 
-        Name the generated module. It must match the name of the shared library
-        you build. At most once across all inputs. If you leave it out entirely,
+        Name the generated module. **It must match the name of the shared library
+        you build**. At most once across all inputs that make up a module. 
+        If you leave it out entirely,
         C-serpent emits the wrappers with no module definition, which is useful
         if you are assembling a module by hand.
 
-    CSERPENT_WRAPFN(names..., options...)
+    CSERPENT_WRAPFN(fn_names..., options...)
 
-        Wrap one or more functions. Any options given apply to all the names.
+        Wrap one or more functions. Options given apply to all the function names.
 
             name = "str"      the name Python sees, if different from the C
-                              name. Only valid with a single name.
-            doc = "str"       docstring
+                              name. Only valid with a single function.
+            doc = "str"       docstring. Only valid with a single function.
             addresses = 0|1   accept python integers, representing raw
                               addresses, where numpy arrays are expected
             bytes = 0|1       accept bytes objects where numpy arrays are
@@ -281,7 +259,7 @@ Annotations
             CSERPENT_WRAPFN(alpha, beta, gamma)
             CSERPENT_WRAPFN(fft_internal, name = "fft", doc = "In-place FFT.")
 
-    CSERPENT_WRAPFN_GENERIC(prefix, options...)
+    CSERPENT_WRAPFN_GENERIC(fn_prefix, options...)
 
         Generate a type-dispatching wrapper over the suffixed variants of
         `prefix`, plus a wrapper for each variant found. See "Generic functions"
@@ -292,13 +270,13 @@ Annotations
                                      from the dispatcher's Python name, so
                                      `sum_` is called as `sum`. 0 keeps it.
 
-    CSERPENT_WRAPFN_MANUAL(names..., options...)
+    CSERPENT_WRAPFN_MANUAL(fn_names..., options...)
 
         If you are writing a wrapper by hand — because C-serpent doesn't support
-        some type or usage pattern — this registers it. C-serpent adds `name` to
-        the module and expects you to supply a function called `wrap_name`,
-        which you prepend to the code C-serpent generates. Accepts `doc` and
-        `name`.
+        some type or usage pattern — this registers it. C-serpent adds each function named to
+        the module and expects you to supply a function called `wrap_<fn_name>`,
+        which you prepend to the code C-serpent generates. Accepts the `doc` and
+        `name` options from CSERPENT_WRAPFN.
 
     CSERPENT_WRAPCONST(names...)
 
@@ -309,7 +287,7 @@ Annotations
             CSERPENT_WRAPCONST(error_code)
             CSERPENT_WRAPCONST(TP_OK, TP_EOF)
 
-        `#define`d constants cannot be wrapped: the preprocessor expands them
+        NB: `#define`d constants cannot be wrapped: the preprocessor expands them
         before C-serpent ever sees them.
 
         Note that the emitted wrapper code needs to be able to access the
@@ -328,19 +306,23 @@ Annotations
             readonly = (a, b)   make these members read-only
             doc = "str"         docstring for the type
 
-        Scalar members are readable and writable. **Everything else is
-        read-only**, and is mutated through the view it returns:
+        **Scalar members are the only ones you can assign to.** For every other
+        kind of member, assigning to the attribute is an error. Nested structs
+        and fixed-size array members are still *mutable*, though, because reading one
+        gives you a *view* onto the struct's own memory rather than a copy —
+        write through the view and the struct changes:
 
-            m.origin.x = 7      # nested struct member, writes through
-            m.coeffs[:] = ...   # fixed-size array member, a numpy view
+            m.origin.x = 7      # works: writes through the nested-struct view
+            m.coeffs[:] = ...   # works: writes through the numpy view
 
-        Pointer members are read-only with no exception: a `char *` reads as a
-        `str`, a pointer to another wrapped struct reads as an instance of it,
-        and anything else reads as an integer address. To *set* one, write a C
-        setter and wrap it, which is safer than accepting a raw address because
-        it goes through C-serpent's usual type checking:
+            m.origin = other    # AttributeError: the attribute is not assignable
+            m.coeffs = [1,2]    # AttributeError: likewise
 
-            void config_set_data(struct Config *c, int32_t *d) { c->data = d; }
+        Pointer members have no view to write through, so they are read-only in
+        the full sense: a `char *` reads as a `str`, a pointer to another
+        wrapped struct reads as an instance of it, and anything else reads as an
+        integer address, but none of them can be written. To *set* one, write a
+        C setter and wrap it.
 
         `struct Foo *` as an argument means one struct, not an array: it accepts
         a `Foo` instance, or `None` for a null pointer. `struct Foo` by value
@@ -359,7 +341,7 @@ Annotations
 
         Bitfields are not supported and produce a parse error naming the
         member. Members of any other type C-serpent cannot represent are an
-        error too, naming the member and suggesting `exclude`.
+        error too, you may be able to work around this with the `exclude` option.
 
         Note that the emitted wrapper code needs to be able to see the struct
         definition, exactly as it does for enum constants. Either use
@@ -411,17 +393,13 @@ CSERPENT_CONVERTER(from_python = view2d_from_obj)
 ```
 
         after which `double view_sum(View2D v)` takes a numpy array from Python
-        with nothing further to write. Put the annotation in the header that
-        defines the type and every consumer of that header gets it for free.
+        with nothing further to write. 
 
-        How permissive the conversion is, is entirely up to you: if your view
-        type carries strides, the converter can accept an array sliced along an
-        outer axis rather than insisting on full C-contiguity. C-serpent has no
-        opinion about it — that logic lives in code you own and can test.
 
-        Converters are keyed on the exact type and apply to `T` by value.
-        Registering one for a type that is also `CSERPENT_WRAPTYPE`'d is an
-        error — pick one. A converter that hands C a pointer into a Python
+        Registering a converter for a type that is also `CSERPENT_WRAPTYPE`'d is an
+        error. 
+
+        A converter that hands C a pointer into a Python
         object (as the example does) is only valid for the duration of the
         call; the C function must not retain it.
 
@@ -449,9 +427,8 @@ CSERPENT_CONVERTER(from_python = view2d_from_obj)
 Error handling
 --------------
 
-C code reports errors in several different ways, and C-serpent knows about the
-common ones. In every case the result is the same from Python: a
-`RuntimeError` carrying the message. Pick whichever matches your code.
+C-Serpent knows about several common C error handling techniques. 
+In every case the result is the same from Python: a `RuntimeError` carrying the message.
 
 Wherever these say "string", either `char *` or `const char *` will do.
 
@@ -466,18 +443,32 @@ CSERPENT_WRAPFN(do_thing, errstr = 1)
 **A separate function reports the error.** C-serpent calls `errcheck` after the
 wrapped function; if it returns a non-NULL string, that becomes the exception.
 `errarg` picks which argument to hand it — `0`, the default, means the wrapped
-function's return value:
+function's return value, other numbers choose which of the function's arguments (1-based) to use:
 
 ```c
 int         read_frame(ctx *c, int n, buffer *b);
-const char *check_err(buffer *b);
+const char *check_err(int code);
 
-CSERPENT_WRAPFN(read_frame, errcheck = check_err, errarg = 3)
+CSERPENT_WRAPFN(read_frame, errcheck = check_err, errarg = 0)
+// this pattern assumes that the return value of read_frame is an error code
 ```
 
-**The caller supplies an error buffer.** A common C idiom: the function takes a
+```c
+int         read_frame(ctx *c, int n, buffer *b);
+const char *check_err(ctx *c);
+
+CSERPENT_WRAPFN(read_frame, errcheck = check_err, errarg = 1)
+// this pattern assumes that the ctx argument contains error information
+```
+
+The argument named by `errarg` stays in the Python signature — it is a normal
+argument that the caller supplies, which C-serpent additionally hands to the
+checker. This is unlike `errbuf` below, which the wrapper supplies itself and
+therefore hides.
+
+**The caller supplies an error buffer.** The function takes a
 `char *errmsg` which is NULL for "print to stderr and exit", or points at a
-caller-provided buffer of some documented length, zeroed on entry, into which a
+caller-provided buffer of some documented length, into which a
 message is written on failure.
 
 ```c
@@ -497,18 +488,10 @@ supplied by the wrapper, not by the caller:
 RuntimeError: negative length: -1
 ```
 
-Because a buffer is always passed, the `errmsg == NULL` branch is unreachable
-from Python. That matters: `exit(EXIT_FAILURE)` inside an extension module
-takes the interpreter down with no traceback.
-
 `errbuf_size` has no default and must be set, either per function or for a
 whole file with `CSERPENT_CONFIG(errbuf_size = N)` as above. It must be at
-least the length your function documents — a buffer that is too small is a
-stack overflow, which is not a thing to guess at.
-
-The `char **errmsg` variant, where the function points you at a static string,
-is not yet supported: C-serpent's type representation does not currently carry
-pointer-to-pointer types.
+least the length your function documents — *a buffer that is too small introduces
+an out-of-bounds write bug*.
 
 **The library asserts, and has no error return path at all.** Some libraries
 let you override an assert or panic handler but give you nowhere to put an
@@ -520,9 +503,14 @@ than lose the interpreter and everything in it.
 becomes an exception:
 
 ```c
-CSERPENT_CONFIG(runtime = 1, errjmp = 1)
-CSERPENT_WRAPFN(lib_mean)
+CSERPENT_CONFIG(runtime = 1)
+CSERPENT_WRAPFN(lib_mean, errjmp = 1)
 ```
+
+`errjmp` can also go in `CSERPENT_CONFIG` to guard every function in the file,
+with individual wraps opting back out using `errjmp = 0`. Guarding costs a
+`setjmp` and a hand-rolled GIL save on each call, so it is usually worth naming
+the functions that can actually assert.
 
 `runtime = 1` emits a small runtime into the generated file:
 
@@ -559,12 +547,8 @@ The runtime defines external symbols; if two C-serpent modules are linked into
 one program and both define them, they collide. Every other module that uses
 `errjmp` emits declarations only and links against the one that has it.
 
-Two things to be honest about. `longjmp` abandons whatever the library had
-allocated or locked at the point of the assertion, so that memory leaks and, if
-it held a lock, the library may be unusable afterwards. And catching a failed
-assertion gets you a traceback pointing at the offending Python line, which is
-the actual goal — it does not promise the library is in a fit state to keep
-using. For a programmer error that is the right trade, but it is a trade.
+The usual `longjmp` caveats still apply. Not all libraries will be safe to use
+in this way.
 
 Command line
 ------------
@@ -661,9 +645,24 @@ are recognised and produce an error naming their replacement.
 | `-a` / `-b` | `addresses = 1` / `bytes = 1`, per function or in `CSERPENT_CONFIG` |
 | `-P`, `-i`, `-I` | removed; preprocessing is now mandatory, and include directories go in `-p` |
 
-`-E` is worth a special mention. It wrapped every enum constant in the
-preprocessed file, which meant its behaviour depended on which headers you had
-included — harmless for some, and 98 stray constants from `netdb.h` for others.
-`CSERPENT_WRAPCONST` requires you to say what you want.
-
 v1 remains available at the git tag `v1.1.4`.
+
+Tests
+-----
+
+    $ python3 tests/run_tests.py
+
+*Codegen* tests run C-serpent over a snippet and check
+what it emitted, or which error it produced. These need only a C compiler.
+*Functional* tests compile the generated wrapper into a real extension module,
+import it, and assert on actual behaviour. *Notebook* tests exercise
+`cserpent.py`. The last two kinds need a C compiler plus Python and numpy headers.
+
+If the Python running the tests lacks those headers, the functional tests are
+skipped with a message. To specify a particular python: 
+
+    $ python3 tests/run_tests.py --python /path/to/venv/bin/python
+
+AI use
+------
+AI tools were used for some of the work on C-Serpent after v1.1.4
