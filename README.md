@@ -186,7 +186,7 @@ $ cc -fPIC -shared \
      -I/usr/lib/python3.11/site-packages/numpy/_core/include \
      -I/usr/include/python3.11 \
      mean_wrappers.c mean.c \
-     -lpython -o means.so
+     -o means.so
 ```
 
 5. call it:
@@ -262,7 +262,7 @@ Annotations
     CSERPENT_WRAPFN_GENERIC(fn_prefix, options...)
 
         Generate a type-dispatching wrapper over the suffixed variants of
-        `prefix`, plus a wrapper for each variant found. See "Generic functions"
+        `fn_prefix`, plus a wrapper for each variant found. See "Generic functions"
         below. Accepts every `CSERPENT_WRAPFN` option, applied to all variants,
         plus:
 
